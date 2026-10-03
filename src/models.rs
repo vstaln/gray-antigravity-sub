@@ -1,16 +1,17 @@
 //! Pinned model catalog: no HTTP `/models` endpoint exists, so the pinned
-//! route table IS the catalog. The CLI's own picker (the `initialize`
-//! handshake) is the live list on Hermes; here discovery degrades to the
-//! pinned table when the CLI is missing or logged out.
+//! route table IS the catalog. The CLI's own `agy models` list is the live
+//! list; here discovery degrades to the pinned table when the CLI is
+//! missing or logged out.
 
 use gray_plugin::{ProviderModel, ProviderModelCatalog};
 
 use crate::catalog;
 
-/// Effort tiers native `--effort` accepts (gray's `off` = flag omitted).
-const EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+/// Full `agy` ids already encode effort, so there is no effort knob: the
+/// catalog advertises no reasoning efforts.
+const EFFORTS: &[&str] = &[];
 
-/// The pinned catalog: every routable id with its window and efforts.
+/// The pinned catalog: every routable id with its window.
 pub fn catalog() -> ProviderModelCatalog {
     let models = catalog::all_ids()
         .into_iter()

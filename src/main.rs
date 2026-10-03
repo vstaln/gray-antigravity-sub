@@ -1,21 +1,21 @@
-//! claude-sub: a protocol-1.2 provider sidecar for Gray.
+//! antigravity-sub: a protocol-1.2 provider sidecar for Gray.
 //!
-//! Claude Pro/Max subscription through the official `claude` CLI: the host
+//! Antigravity subscription through the official `agy` CLI: the host
 //! owns tools, approvals and compaction, the sidecar only answers — one
 //! upstream request per chat turn, enforced by the admission relay.
 //!
 //! Wire (NDJSON over stdio, host ids are opaque):
-//! - `plugin/manifest` → manifest + the `claude-subscription` provider decl.
+//! - `plugin/manifest` → manifest + the `antigravity-subscription` provider decl.
 //! - `provider/models` → pinned catalog (no HTTP endpoint exists).
 //! - `provider/chat` → one relayed turn (declares the per-turn relay URL +
 //!   bearer the host's standard Responses POST must use).
-//! - `provider/auth/*` → the user's own `claude auth login` owns
+//! - `provider/auth/*` → the user's own `agy` Google sign-in owns
 //!   credentials; start/poll report external-login status, refresh/revoke
 //!   are unsupported.
 //! - `plugin/shutdown` → clean exit. Unknown methods are protocol errors
 //!   (provider sidecars must fail loudly, never hang a turn).
 
-use claude_sub::{catalog, manifest, models, relay, setup};
+use antigravity_sub::{catalog, manifest, models, relay, setup};
 
 use gray_plugin::{ProviderRefreshRequest, ProviderRevokeRequest, ProviderRpcError};
 use serde::{Deserialize, Serialize};
@@ -102,11 +102,25 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
                     .and_then(Value::as_str)
                     .unwrap_or_default(),
             )?;
-            // External login: the CLI owns credentials; report where to fix it.
-            match setup::resolve_command() {
-                None => Err(ProviderRpcError::Unavailable(setup::INSTALL_HINT.into())),
-                Some(_) => Err(ProviderRpcError::Unavailable(
-                    "Claude Code login lives in your terminal: run `claude auth login`, then retry.".into(),
+            // External login: the CLI owns credentials. Probe real login
+            // state (HOME-isolated, offline-safe); report where to fix it.
+            if setup::resolve_command().is_none() {
+                return Err(ProviderRpcError::Unavailable(setup::INSTALL_HINT.into()));
+            }
+            if let Some(key) = setup::conflicting_env() {
+                return Err(ProviderRpcError::Unavailable(format!(
+                    "subscription provider refuses conflicting {key}: unset it so native uses your Antigravity login"
+                )));
+            }
+            match tokio::task::spawn_blocking(setup::probe_login).await {
+                Ok(setup::LoginState::LoggedIn) => Ok(json!({"status": "authenticated"})),
+                Ok(setup::LoginState::LoggedOut) | Ok(setup::LoginState::Unknown) => {
+                    Err(ProviderRpcError::Unavailable(
+                        "Antigravity sign-in lives in your terminal: run `agy` once and complete the Google sign-in, then retry.".into(),
+                    ))
+                }
+                Err(_) => Err(ProviderRpcError::Unavailable(
+                    "Antigravity sign-in lives in your terminal: run `agy` once and complete the Google sign-in, then retry.".into(),
                 )),
             }
         }
@@ -162,28 +176,23 @@ async fn chat_turn(relays: &Relays, params: Value) -> Result<Value, ProviderRpcE
     let model = params
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or("sonnet")
+        .unwrap_or("flash")
         .to_string();
-    let effort: Option<String> = params
-        .get("effort")
-        .and_then(Value::as_str)
-        .map(str::to_string);
     // Fail fast before opening anything: no binary, no login, no relay.
     if crate::setup::resolve_command().is_none() {
         return Err(ProviderRpcError::Unavailable(setup::INSTALL_HINT.into()));
     }
     if let Some(key) = setup::conflicting_env() {
         return Err(ProviderRpcError::Unavailable(format!(
-            "subscription provider refuses conflicting {key}: unset it so native uses your Claude login"
+            "subscription provider refuses conflicting {key}: unset it so native uses your Antigravity login"
         )));
     }
-    let bearer = format!("claude-sub-{}", hex_id());
+    let bearer = format!("antigravity-sub-{}", hex_id());
     // The relay server is per-turn: bind now so the host gets a live port.
     // The admitted POST carries the Responses body; the handler translates,
     // spawns native, folds SSE and streams it back.
     let intent = relay::RelayIntent {
         model: model.clone(),
-        effort: effort.clone(),
     };
     relays
         .lock()
@@ -201,7 +210,7 @@ async fn chat_turn(relays: &Relays, params: Value) -> Result<Value, ProviderRpcE
     Ok(json!({
         "relay_url": format!("http://127.0.0.1:{port}/relay/{bearer}/responses"),
         "relay_token": bearer,
-        "native_model": catalog::native_model(&model).map_err(ProviderRpcError::Unavailable)?,
+        "native_model": catalog::native_model(&model),
     }))
 }
 

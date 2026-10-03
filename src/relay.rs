@@ -1,13 +1,11 @@
-//! Loopback admission relay: the single-request gate in front of `claude`.
-//! Port of the Hermes DirectSDK `admission.py`
-//! (NousResearch/hermes-plugin-claude-subscription-directsdk, MIT).
+//! Loopback admission relay: the single-request gate in front of `agy`.
 //!
 //! Per chat turn the sidecar opens a loopback HTTP server and hands the
 //! host a per-turn relay URL + bearer. The host POSTs its standard
 //! Responses body there; the relay admits exactly ONE request (anything
-//! past it gets 400 `ADMISSION_CONSUMED`), translates it to native frames,
-//! spawns `claude` (which makes exactly one upstream request on its own),
-//! folds the native transcript to Responses SSE and streams it back.
+//! past it gets 400 `ADMISSION_CONSUMED`), translates it to one funnel
+//! turn, spawns `agy` (which makes exactly one upstream request on its
+//! own), folds the native transcript to Responses SSE and streams it back.
 //!
 //! Credentials are forwarded, never persisted: the bearer is a per-turn
 //! token minted by the sidecar, never the user's OAuth token.
@@ -23,7 +21,6 @@ use serde_json::{Value, json};
 /// What `provider/chat` parked for one turn: the relay fills the body in.
 pub struct RelayIntent {
     pub model: String,
-    pub effort: Option<String>,
 }
 
 pub type Intents = Arc<Mutex<HashMap<String, RelayIntent>>>;
@@ -161,20 +158,14 @@ fn run_turn(intents: &Intents, bearer: &str, raw: &[u8]) -> Result<Vec<u8>, Stri
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    let extra = crate::chat::extra_body(&turn.names, &tools);
-    // History frames replay first (no-query each), the final frame queries:
-    // native makes exactly one upstream request on its own.
-    let lines = crate::chat::spawn_turn(
-        &turn,
-        &extra,
-        &turn.system.clone(),
-        intent.effort.as_deref(),
-        std::time::Duration::from_secs(300),
-    )?;
     let names: Vec<String> = tools
         .iter()
         .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
         .collect();
+    // Staged HOME + single funnel line: native makes exactly one upstream
+    // request on its own.
+    let isolation = crate::chat::TurnIsolation::stage()?;
+    let lines = crate::chat::spawn_turn(&turn, &isolation, std::time::Duration::from_secs(300))?;
     let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
     let (sse, _, _, _, _, _) = crate::chat::fold_lines(&lines, &names, &say)?;
     Ok(sse)

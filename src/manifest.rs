@@ -1,18 +1,19 @@
-//! The exact protocol-1.2 Claude subscription provider declaration.
+//! The exact protocol-1.2 Antigravity subscription provider declaration.
 
 use gray_plugin::{
     AuthMethodDecl, PROVIDER_CREDENTIALS, ProviderDecl, ProviderHeaderDecl,
     ProviderRequestPolicyDecl, ProviderTransportDecl,
 };
 
-pub const PLUGIN_NAME: &str = "claude-sub";
+pub const PLUGIN_NAME: &str = "antigravity-sub";
 pub const PLUGIN_VERSION: &str = "0.1.0";
-pub const PROVIDER_ID: &str = "claude-subscription";
-pub const AUTH_METHOD_ID: &str = "claude-login";
+pub const PROVIDER_ID: &str = "antigravity-subscription";
+pub const AUTH_METHOD_ID: &str = "antigravity-login";
 
 /// A protocol-1.2 manifest value. Credentials stay with the user's own
-/// `claude auth login`: the `external-login` method performs no OAuth, it
-/// only names the login the chat path probes before spawning.
+/// `agy` sign-in (OS keyring + browser): the `external-login` method
+/// performs no OAuth, it only names the login the chat path probes before
+/// spawning.
 pub fn manifest() -> gray_plugin::Manifest {
     gray_plugin::Manifest {
         name: PLUGIN_NAME.to_string(),
@@ -31,14 +32,14 @@ pub fn manifest() -> gray_plugin::Manifest {
     }
 }
 
-/// Claude subscription provider. Requests go to the loopback relay the
+/// Antigravity subscription provider. Requests go to the loopback relay the
 /// sidecar opens per chat turn (see `chat`); the host adds bearer, policy,
 /// and every declared header from this declaration. The bearer is a
 /// per-turn relay token minted by the sidecar, never the user's OAuth token.
 pub fn provider() -> ProviderDecl {
     ProviderDecl {
         id: PROVIDER_ID.to_string(),
-        name: "Claude subscription".to_string(),
+        name: "Antigravity subscription".to_string(),
         transport: ProviderTransportDecl {
             kind: "openai-responses".to_string(),
             base_url: "https://127.0.0.1:1/"
@@ -66,7 +67,7 @@ pub fn provider() -> ProviderDecl {
         },
         auth_methods: vec![AuthMethodDecl {
             id: AUTH_METHOD_ID.to_string(),
-            name: "Claude Code login".to_string(),
+            name: "Antigravity CLI sign-in".to_string(),
             kind: "api_key".to_string(),
             operations: vec!["models".to_string()],
         }],

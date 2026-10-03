@@ -1,512 +1,353 @@
-//! Claude Pro/Max subscription provider: gray's agent loop drives the official
-//! `claude` CLI fully inert, one upstream request per turn. Port of the Hermes
-//! DirectSDK transport (NousResearch/hermes-plugin-claude-subscription-directsdk,
-//! MIT) minus the HTTP admission relay: with `--tools ''` + `--max-turns` absent
-//! (this CLI has no such flag) + `dontAsk`, native makes exactly one request on
-//! its own; the relay returns with the in-tree admission module if retries ever
-//! double-spend. Gray owns tools, approvals and compaction — Claude only answers.
+//! Direct in-process Antigravity subscription provider: implements
+//! `gray_core::agent::Provider` by spawning the official `agy` CLI per turn
+//! as a fully inert funnel — its only tool is `finish`, and gray owns all
+//! real tools, approvals and compaction.
 //!
-//! Request shape per turn: a private staging dir (`system.md`, `settings.json`
-//! carrying `CLAUDE_CODE_EXTRA_BODY`, inert MCP config), then
-//! `claude -p --model <native> --input-format stream-json --output-format
-//! stream-json --verbose --include-partial-messages --tools '' ...` with the
-//! translated frames on stdin. History frames replay first (`shouldQuery:
-//! false`, zero-turn ack each), the final user/tool-result frame queries.
-//!
-//! Native assistant messages round-trip in `ContentBlock::Thinking`
-//! (`item_id: NATIVE_ITEM_ID`, `encrypted_content`: native messages JSON) so the
-//! next turn restores byte-identical frames instead of re-derived ones — same
-//! carrier trick as the Anthropic thinking replay, gated on same-model.
+//! `agy` owns credentials (OS keyring + browser sign-in): this provider
+//! never reads, stores, logs, or forwards any token. Auth reaches the child
+//! through a staged HOME holding a symlink to the user's own
+//! `~/.gemini/antigravity-cli` credential dir — token bytes are never
+//! opened by this process. Fail-closed probes (`conflicting_env`, staged
+//! `settings.json`, missing credential dir) refuse to spawn rather than
+//! run degraded.
 
-use std::collections::{BTreeMap, HashSet};
-use std::io::Write;
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::io::{BufRead, Write};
 use std::process::Stdio;
 
-use futures::stream::{self, BoxStream, StreamExt};
+use futures::StreamExt;
+use futures::stream::{self, BoxStream};
 use gray_core::agent::{Provider, ProviderError};
 use gray_core::event::{StopReason, StreamEvent, Usage};
-use gray_core::message::{ChatRequest, ContentBlock, Role};
+use gray_core::message::{ChatRequest, ContentBlock, Message, Role};
 use serde_json::{Value, json};
-use std::io::BufRead as _;
 
-/// Model-id prefix selecting this provider in `/model` and config.
-/// Full ids look like `claude-sub/sonnet`, `claude-sub/opus[1m]`.
-pub const MODEL_PREFIX: &str = "claude-sub/";
-/// Tool-name prefix native sees (host names restored on the way back).
-pub const TOOL_PREFIX: &str = "mcp__gray__";
-/// `ReasoningItem::item_id` marking a native-assistant replay carrier: the
-/// `encrypted_content` is the response's native assistant `message` objects as
-/// a JSON array, so they go back byte for byte.
-pub const NATIVE_ITEM_ID: &str = "claude-subscription-native";
-/// Carrier version: a mismatch means "re-derive", never "restore stale".
+use crate::{catalog, chat, setup};
+
+/// `agy` is missing (or not on PATH): install hint, never a spawn panic.
+pub use crate::setup::INSTALL_HINT;
+
+/// Tool-name namespace: gray tools live in the `finish` schema's `calls[]`
+/// array (host names, unprefixed). There is no native tool prefix because
+/// gray tools are never passed as native tools.
+pub const NATIVE_ITEM_ID: &str = "antigravity-subscription-native";
+
 const CARRIER_VERSION: u32 = 1;
-/// `claude` is missing (or not on PATH): install hint, never a spawn panic.
-const INSTALL_HINT: &str = "`claude` not found on PATH. Install it with \
-    `npm install -g @anthropic-ai/claude-code`, then `claude auth login`. \
-    Override the binary with CLAUDE_SUB_COMMAND=/path/to/claude.";
-/// Pinned native routes: canonical id → context window. A loopback gateway
-/// needs explicit long-context selection; unpinned ids run at the 200K native
-/// default and are never guessed up to 1M (same invariant as the reference).
-fn context_windows() -> &'static [(&'static str, usize)] {
-    &[
-        ("claude-sonnet-5", 1_000_000),
-        ("claude-haiku-4-5-20251001", 200_000),
-        ("claude-opus-5-5", 1_000_000),
-        ("claude-opus-5", 1_000_000),
-        ("claude-opus-4-8", 1_000_000),
-        ("claude-fable-5-1", 1_000_000),
-    ]
-}
 
-fn aliases() -> &'static [(&'static str, &'static str)] {
-    &[
-        ("sonnet", "claude-sonnet-5"),
-        ("haiku", "claude-haiku-4-5-20251001"),
-        ("claude-haiku-4-5", "claude-haiku-4-5-20251001"),
-        ("opus", "claude-opus-5-5"),
-        ("fable", "claude-fable-5-1"),
-    ]
-}
-
-/// Pinned route ids behind the `claude-sub/` prefix (seed for `/model`).
-pub fn pinned_ids() -> &'static [&'static str] {
-    &["opus", "sonnet", "haiku", "fable"]
-}
-
-/// Context window for a route: pinned table, else the 200K native default.
-/// `[1m]`-suffixed ids report `None` (no guess exceeds the 1M native budget).
-pub fn context_window(model: &str) -> Option<usize> {
-    let base = model.strip_suffix("[1m]").unwrap_or(model);
-    let canonical = aliases()
-        .iter()
-        .find(|(a, _)| *a == base)
-        .map(|(_, c)| *c)
-        .unwrap_or(base);
-    if let Some((_, w)) = context_windows().iter().find(|(id, _)| *id == canonical) {
-        return Some(*w);
-    }
-    if model.ends_with("[1m]") {
-        return None;
-    }
-    Some(200_000)
-}
-
-/// Native `--model` selection: pinned 1M ids get `[1m]`, 200K ids go bare
-/// (Haiku 4.5 has no 1M route), unpinned ids pass through untouched.
-pub fn native_model(model: &str) -> Result<String, ProviderError> {
-    let base = model.strip_suffix("[1m]").unwrap_or(model);
-    let canonical = aliases()
-        .iter()
-        .find(|(a, _)| *a == base)
-        .map(|(_, c)| *c)
-        .unwrap_or(base);
-    match context_windows().iter().find(|(id, _)| *id == canonical) {
-        Some((_, 1_000_000)) => Ok(format!("{canonical}[1m]")),
-        Some((_, 200_000)) => {
-            if model.ends_with("[1m]") {
-                return Err(ProviderError::BadRequest(
-                    "Haiku 4.5 does not support a 1M context window".into(),
-                ));
-            }
-            Ok(canonical.to_string())
-        }
-        _ => Ok(model.to_string()),
-    }
-}
-
-/// Resolve the `claude` binary: explicit override, then PATH.
-pub fn resolve_command() -> Option<String> {
-    let env: Vec<(String, String)> = std::env::vars().collect();
-    let lookup = |k: &str| env.iter().find(|(a, _)| a == k).map(|(_, v)| v.clone());
-    resolve_command_for_env(&lookup).or_else(which_claude)
-}
-
-#[cfg(test)]
-fn resolve_command_for(pairs: &[(&str, &str)]) -> Option<String> {
-    let lookup = |k: &str| {
-        pairs
-            .iter()
-            .find(|(a, _)| *a == k)
-            .map(|(_, v)| v.to_string())
-    };
-    resolve_command_for_env(&lookup)
-}
-
-fn resolve_command_for_env(lookup: &dyn Fn(&str) -> Option<String>) -> Option<String> {
-    for var in [
-        "CLAUDE_SUB_COMMAND",
-        "CLAUDE_SUBSCRIPTION_DIRECTSDK_COMMAND",
-    ] {
-        if let Some(v) = lookup(var)
-            && !v.is_empty()
-        {
-            return Some(v);
+pub fn resolve_command_for(vars: &[(&str, &str)]) -> Option<String> {
+    for (k, v) in vars {
+        if (*k == "AGY_SUB_COMMAND" || *k == "ANTIGRAVITY_SUB_COMMAND") && !v.is_empty() {
+            return Some(v.to_string());
         }
     }
-    None
+    setup::resolve_command()
 }
 
-fn which_claude() -> Option<String> {
-    let path = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&path) {
-        for name in ["claude", "claude.exe", "claude.cmd"] {
-            let p = dir.join(name);
-            if p.is_file() {
-                return Some(p.to_string_lossy().into_owned());
-            }
-        }
-    }
-    None
+fn resolve_command() -> Option<String> {
+    setup::resolve_command()
 }
 
-/// Normalize a tool input schema: strip top-level `oneOf`/`allOf`/`anyOf`
-/// (Anthropic hard-400s) and guarantee object schemas carry `properties`.
-/// Nested unions stay untouched — handlers re-validate their arguments.
-pub(crate) fn normalize_input_schema(schema: &Value) -> Value {
-    let mut out = schema.clone();
-    if let Some(obj) = out.as_object_mut() {
-        for key in ["oneOf", "allOf", "anyOf"] {
-            obj.remove(key);
-        }
-        obj.entry("type".to_string())
-            .or_insert(Value::String("object".to_string()));
-        if obj.get("type").and_then(Value::as_str) == Some("object")
-            && !matches!(obj.get("properties"), Some(Value::Object(_)))
-        {
-            obj.insert("properties".to_string(), json!({}));
-        }
-    }
-    out
+pub fn context_window(model: &str) -> Option<u32> {
+    catalog::context_window(model)
 }
 
-/// Tool-name validity: unique ASCII identifiers, at most 50 chars.
-fn check_tool_name(name: &str, seen: &HashSet<String>) -> Result<(), ProviderError> {
-    if name.len() > 50
-        || name.is_empty()
-        || !name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-        || seen.contains(name)
-    {
-        return Err(ProviderError::BadRequest(format!(
-            "tool names must be unique ASCII identifiers of at most 50 characters: {name:?}"
-        )));
-    }
-    Ok(())
+pub fn native_model(model: &str) -> String {
+    catalog::native_model(model)
 }
 
-/// One translated turn: system text, native history frames, the inert tool
-/// manifest, and the host tool names in order.
+/// One translated turn: funnel content line + schema + host tool names.
 pub(crate) struct PreparedTurn {
     pub system: String,
-    pub frames: Vec<Value>,
+    pub content_line: String,
+    pub schema: Value,
     pub names: Vec<String>,
     pub native_model: String,
 }
 
-/// Translate a gray request into native history frames. Assistant tool calls
-/// go out prefixed; tool results come back as user frames. A same-model
-/// native carrier restores byte-identical frames; anything else re-derives.
+/// Normalize a tool input schema: strip top-level `oneOf`/`allOf`/`anyOf`
+/// and guarantee object schemas carry `properties`.
+pub fn normalize_input_schema(schema: &Value) -> Value {
+    chat::normalize_input_schema(schema)
+}
+
+fn is_name_ok(name: &str, seen: &HashSet<String>) -> bool {
+    !name.is_empty()
+        && name.len() <= 50
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+        && !seen.contains(name)
+}
+
+/// Render one gray message to funnel transcript text. Tool calls and results
+/// render as explicit records; thinking carriers restore nothing (agy has
+/// no replay) but their text still carries the prior answer.
+fn render_message(msg: &Message) -> Result<Option<String>, ProviderError> {
+    match msg.role {
+        Role::System => {
+            // System messages fold into the system text, not the transcript.
+            Ok(None)
+        }
+        Role::Assistant => {
+            let mut blocks: Vec<String> = Vec::new();
+            for block in &msg.content {
+                match block {
+                    ContentBlock::Text { text } => {
+                        if !text.trim().is_empty() {
+                            blocks.push(text.clone());
+                        }
+                    }
+                    ContentBlock::ToolUse { id, name, args } => {
+                        blocks.push(format!(
+                            "[Tool call {name} id={id}]\n{}",
+                            serde_json::to_string(args).unwrap_or_else(|_| "{}".into())
+                        ));
+                    }
+                    ContentBlock::Thinking { text, .. } => {
+                        // Prior answer text (carrier restores nothing; the
+                        // text still anchors the transcript).
+                        if !text.trim().is_empty() {
+                            blocks.push(text.clone());
+                        }
+                    }
+                    ContentBlock::ToolResult { .. } => {
+                        return Err(ProviderError::BadRequest(
+                            "assistant messages cannot carry tool results".into(),
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            if blocks.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(format!("[Assistant]\n{}", blocks.join("\n"))))
+            }
+        }
+        Role::User => {
+            let mut blocks: Vec<String> = Vec::new();
+            for block in &msg.content {
+                match block {
+                    ContentBlock::Text { text } => {
+                        if !text.trim().is_empty() {
+                            blocks.push(text.clone());
+                        }
+                    }
+                    ContentBlock::StructuredInput { .. } => {
+                        if let Some(text) = block.provider_text()
+                            && !text.is_empty()
+                        {
+                            blocks.push(text);
+                        }
+                    }
+                    ContentBlock::Image { .. } | ContentBlock::Media { .. } => {
+                        return Err(ProviderError::BadRequest(
+                            "image/media input is unsupported by the Antigravity funnel".into(),
+                        ));
+                    }
+                    ContentBlock::ToolResult {
+                        id,
+                        content,
+                        is_error,
+                    } => {
+                        let text = content.clone();
+                        let text = if text.is_empty() {
+                            "(no output)".to_string()
+                        } else {
+                            text
+                        };
+                        let flag = if *is_error { " (error)" } else { "" };
+                        blocks.push(format!("[Tool result id={id}]{flag}\n{text}"));
+                    }
+                    ContentBlock::ToolUse { .. } | ContentBlock::Thinking { .. } => {
+                        return Err(ProviderError::BadRequest(
+                            "user messages cannot carry tool calls or thinking".into(),
+                        ));
+                    }
+                }
+            }
+            if blocks.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(format!("[User]\n{}", blocks.join("\n"))))
+            }
+        }
+    }
+}
+
+/// Translate a `ChatRequest` into one funnel turn. Assistant tool calls keep
+/// host names (no prefix: gray tools are never native tools); reasoning
+/// carriers restore nothing (agy has no replay event) — anything else
+/// re-derives.
 pub(crate) fn prepare_turn(req: &ChatRequest, model: &str) -> Result<PreparedTurn, ProviderError> {
+    let mut names: Vec<String> = Vec::new();
+    let mut seen_names: HashSet<String> = HashSet::new();
+    for t in &req.tools {
+        if !is_name_ok(&t.name, &seen_names) {
+            return Err(ProviderError::BadRequest(format!(
+                "tool names must be unique ASCII identifiers of at most 50 characters: {:?}",
+                t.name
+            )));
+        }
+        seen_names.insert(t.name.clone());
+        names.push(t.name.clone());
+    }
     let mut system_parts: Vec<String> = Vec::new();
     if let Some(s) = &req.system
         && !s.is_empty()
     {
         system_parts.push(s.clone());
     }
-    let mut frames: Vec<Value> = Vec::new();
-    let mut names: Vec<String> = Vec::new();
-    let mut seen_names: HashSet<String> = HashSet::new();
-    let mut tool_index: BTreeMap<String, String> = BTreeMap::new();
-    for t in &req.tools {
-        check_tool_name(&t.name, &seen_names)?;
-        seen_names.insert(t.name.clone());
-        names.push(t.name.clone());
-        tool_index.insert(t.name.clone(), format!("{TOOL_PREFIX}{}", t.name));
-    }
+    let mut transcript: Vec<String> = Vec::new();
     for msg in &req.messages {
-        match msg.role {
-            Role::System => {
-                if !frames.is_empty() {
-                    return Err(ProviderError::BadRequest(
-                        "system messages must precede conversation history".into(),
-                    ));
-                }
-                let text = msg.text_content();
-                system_parts.push(text);
-            }
-            Role::Assistant => {
-                // Signed-carrier replay: only this model's own blocks go back.
-                let mut restored = false;
-                let carriers: Vec<&ContentBlock> = msg
-                    .content
-                    .iter()
-                    .filter(|b| {
-                        matches!(
-                            b,
-                            ContentBlock::Thinking { item_id: Some(id), model: Some(from), .. }
-                            if id == NATIVE_ITEM_ID && from == model
-                        )
-                    })
-                    .collect();
-                if carriers.len() == 1
-                    && let ContentBlock::Thinking {
-                        text,
-                        encrypted_content: Some(blob),
-                        ..
-                    } = carriers[0]
+        if msg.role == Role::System {
+            for b in &msg.content {
+                if let ContentBlock::Text { text } = b
+                    && !text.is_empty()
                 {
-                    // Blob is the full carrier object; the bare array is the
-                    // pre-release shape (no version gate — re-derive on doubt).
-                    let parsed = serde_json::from_str::<Value>(blob).ok();
-                    let saved: Option<Vec<Value>> = match &parsed {
-                        Some(Value::Array(natives)) => Some(natives.clone()),
-                        Some(obj)
-                            if obj.get("type").and_then(Value::as_str) == Some(NATIVE_ITEM_ID)
-                                && obj.get("version").and_then(Value::as_u64)
-                                    == Some(CARRIER_VERSION as u64) =>
-                        {
-                            obj.get("messages").and_then(Value::as_array).cloned()
-                        }
-                        _ => None,
-                    };
-                    if let Some(saved) = saved {
-                        // Host compaction owns visible history: only restore when
-                        // the carrier's projection still matches this message.
-                        let expected = carrier_projection(text, msg);
-                        let actual = live_projection(msg, &tool_index);
-                        if expected == actual {
-                            for native in saved {
-                                frames.push(json!({"type": "assistant", "message": native}));
-                            }
-                            restored = true;
-                        }
-                    }
-                }
-                if !restored {
-                    if !carriers.is_empty() && carriers.len() != 1 {
-                        return Err(ProviderError::BadRequest(
-                            "unsupported native assistant carrier version".into(),
-                        ));
-                    }
-                    let mut blocks: Vec<Value> = Vec::new();
-                    for block in &msg.content {
-                        match block {
-                            ContentBlock::Text { text } => {
-                                if !text.is_empty() {
-                                    blocks.push(json!({"type": "text", "text": text}));
-                                }
-                            }
-                            ContentBlock::StructuredInput { .. } => {
-                                if let Some(text) = block.provider_text()
-                                    && !text.is_empty()
-                                {
-                                    blocks.push(json!({"type": "text", "text": text}));
-                                }
-                            }
-                            ContentBlock::Image { media_type, data } => {
-                                blocks.push(json!({"type": "image", "source": {
-                                    "type": "base64", "media_type": media_type, "data": data}}));
-                            }
-                            ContentBlock::Video { .. } => {
-                                return Err(crate::openai::video_rejected(model));
-                            }
-                            ContentBlock::ToolUse { id, name, args } => {
-                                let input = if args.is_object() {
-                                    args.clone()
-                                } else {
-                                    json!({})
-                                };
-                                let prefixed = tool_index
-                                    .get(name)
-                                    .cloned()
-                                    .unwrap_or_else(|| format!("{TOOL_PREFIX}{name}"));
-                                blocks.push(json!({"type": "tool_use", "id": id,
-                                    "name": prefixed, "input": input}));
-                            }
-                            ContentBlock::ToolResult { .. } => {
-                                return Err(ProviderError::BadRequest(
-                                    "assistant messages cannot carry tool results".into(),
-                                ));
-                            }
-                            ContentBlock::Thinking { .. } => {
-                                // Foreign/display-only thinking never reaches native.
-                            }
-                        }
-                    }
-                    if !blocks.is_empty() {
-                        frames.push(json!({"type": "assistant",
-                            "message": {"role": "assistant", "content": blocks}}));
-                    }
+                    system_parts.push(text.clone());
                 }
             }
-            Role::User => {
-                let mut blocks: Vec<Value> = Vec::new();
-                for block in &msg.content {
-                    match block {
-                        ContentBlock::Text { text } => {
-                            if !text.is_empty() {
-                                blocks.push(json!({"type": "text", "text": text}));
-                            }
-                        }
-                        ContentBlock::StructuredInput { .. } => {
-                            if let Some(text) = block.provider_text()
-                                && !text.is_empty()
-                            {
-                                blocks.push(json!({"type": "text", "text": text}));
-                            }
-                        }
-                        ContentBlock::Image { media_type, data } => {
-                            blocks.push(json!({"type": "image", "source": {
-                                "type": "base64", "media_type": media_type, "data": data}}));
-                        }
-                        ContentBlock::Video { .. } => {
-                            return Err(crate::openai::video_rejected(model));
-                        }
-                        ContentBlock::ToolResult {
-                            id,
-                            content,
-                            is_error,
-                        } => {
-                            let text = crate::openai::wire_tool_output(content, *is_error);
-                            let text = if text.is_empty() {
-                                "(no output)".to_string()
-                            } else {
-                                text
-                            };
-                            blocks.push(json!({"type": "tool_result",
-                                "tool_use_id": id, "content": text, "is_error": is_error}));
-                        }
-                        ContentBlock::ToolUse { .. } | ContentBlock::Thinking { .. } => {
-                            return Err(ProviderError::BadRequest(
-                                "user messages cannot carry tool calls or thinking".into(),
-                            ));
-                        }
-                    }
-                }
-                if blocks.is_empty() {
-                    continue;
-                }
-                if let Some(last) = frames.last_mut()
-                    && last.get("type").and_then(Value::as_str) == Some("user")
-                    && let Some(content) = last
-                        .pointer_mut("/message/content")
-                        .and_then(Value::as_array_mut)
-                {
-                    content.extend(blocks);
-                    continue;
-                }
-                frames.push(json!({"type": "user",
-                    "message": {"role": "user", "content": blocks}}));
-            }
+            continue;
+        }
+        match render_message(msg)? {
+            Some(t) => transcript.push(t),
+            None => continue,
         }
     }
-    let Some(last) = frames.last() else {
+    if transcript.is_empty() {
+        return Err(ProviderError::BadRequest(
+            "history must end in a nonempty user/tool-result message".into(),
+        ));
+    }
+    let Some(last) = req.messages.last() else {
         return Err(ProviderError::BadRequest(
             "history must end in a nonempty user/tool-result message".into(),
         ));
     };
-    if last.get("type").and_then(Value::as_str) != Some("user")
-        || last
-            .pointer("/message/content")
-            .and_then(Value::as_array)
-            .is_none_or(Vec::is_empty)
+    if last.role != Role::User
+        || last.content.is_empty()
+        || last.content.iter().all(|b| match b {
+            ContentBlock::Text { text } => text.trim().is_empty(),
+            ContentBlock::StructuredInput { .. } => false,
+            _ => true,
+        })
     {
-        return Err(ProviderError::BadRequest(
-            "history must end in a nonempty user/tool-result message; assistant prefill is unsupported".into(),
+        // The last message must carry something answerable: user text, a
+        // structured input, or a tool result. Assistant prefill (or a
+        // tool-use-only tail) is unsupported.
+        let answerable = last.content.iter().any(|b| match b {
+            ContentBlock::Text { text } => !text.trim().is_empty(),
+            ContentBlock::StructuredInput { .. } => true,
+            ContentBlock::ToolResult { .. } => true,
+            _ => false,
+        });
+        if last.role != Role::User || !answerable {
+            return Err(ProviderError::BadRequest(
+                "history must end in a nonempty user/tool-result message; assistant prefill is unsupported".into(),
+            ));
+        }
+    }
+    // Tool manifest for the system text: name + description + schema.
+    let mut tool_specs: Vec<String> = Vec::new();
+    for t in &req.tools {
+        tool_specs.push(format!(
+            "- {}: {} Args: {}",
+            t.name,
+            t.description,
+            normalize_input_schema(&t.parameters)
         ));
     }
+    let mut funnel_system: Vec<String> = Vec::new();
+    funnel_system.push(
+        "You are a model provider inside the gray agent harness. You have exactly one tool: finish. \
+        You have NO other tools - never call any native tool for any reason. Gray owns all tools, approvals, and the filesystem. \
+        To use a gray tool, list it in the calls array with its name and args object, and put your reply text in answer."
+            .to_string(),
+    );
+    if !tool_specs.is_empty() {
+        funnel_system.push(format!("Available gray tools:\n{}", tool_specs.join("\n")));
+    } else {
+        funnel_system.push("Available gray tools: none for this request.".to_string());
+    }
+    if !system_parts.is_empty() {
+        funnel_system.push(system_parts.join("\n\n"));
+    }
+    let schema = json!({
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string"},
+            "calls": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tool": {"type": "string"},
+                        "args": {"type": "object"},
+                    },
+                    "required": ["tool"],
+                },
+            },
+        },
+        "required": ["answer"],
+    });
     Ok(PreparedTurn {
-        system: system_parts.join("\n\n"),
-        frames,
+        system: funnel_system.join("\n\n"),
+        content_line: transcript.join("\n\n"),
+        schema,
         names,
-        native_model: native_model(model)?,
+        native_model: native_model(model),
     })
-}
-
-/// Projection of the visible message the carrier must still match: stripped
-/// text + tool calls (host names). A mismatch means compaction or hooks
-/// rewrote history — re-derive, never restore stale signed blocks.
-fn live_projection(
-    msg: &gray_core::message::Message,
-    prefixed: &BTreeMap<String, String>,
-) -> Value {
-    let mut text = String::new();
-    let mut calls: Vec<Value> = Vec::new();
-    for b in &msg.content {
-        match b {
-            ContentBlock::Text { text: t } => text.push_str(t),
-            ContentBlock::ToolUse { id, name, args } => {
-                let prefixed_name = prefixed.get(name).cloned().unwrap_or_else(|| name.clone());
-                calls.push(json!({"id": id, "name": prefixed_name, "input": args}));
-            }
-            _ => {}
-        }
-    }
-    json!({"content": text.trim(), "tool_calls": calls})
-}
-
-/// Projection the carrier stored at capture time: same shape as
-/// `live_projection`, with the saved prose text.
-fn carrier_projection(saved_text: &str, msg: &gray_core::message::Message) -> Value {
-    let mut calls: Vec<Value> = Vec::new();
-    for b in &msg.content {
-        if let ContentBlock::ToolUse { id, name, args } = b {
-            calls.push(json!({"id": id, "name": name, "input": args}));
-        }
-    }
-    json!({"content": saved_text.trim(), "tool_calls": calls})
 }
 
 /// Map native `result` usage onto gray's inclusive `Usage`.
 pub(crate) fn map_usage(u: &Value) -> Usage {
     let input = u.get("input_tokens").and_then(Value::as_u64).unwrap_or(0) as usize;
     let output = u.get("output_tokens").and_then(Value::as_u64).unwrap_or(0) as usize;
-    let read = u
-        .get("cache_read_input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
-    let write = u
-        .get("cache_creation_input_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
     let thinking = u
-        .pointer("/output_tokens_details/thinking_tokens")
+        .get("thinking_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0) as usize;
+    let read = u
+        .get("cache_read_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0) as usize;
     Usage {
-        input_tokens: input.saturating_add(read).saturating_add(write),
-        output_tokens: output,
-        reasoning_tokens: thinking.min(output),
+        input_tokens: input.saturating_add(read),
+        output_tokens: output.saturating_add(thinking),
+        reasoning_tokens: thinking.min(output.saturating_add(thinking)),
         cached_tokens: read,
         non_cached_input_tokens: input,
         cache_read_input_tokens: read,
-        cache_write_input_tokens: write,
+        cache_write_input_tokens: 0,
         total_tokens: input
             .saturating_add(read)
-            .saturating_add(write)
-            .saturating_add(output),
+            .saturating_add(output)
+            .saturating_add(thinking),
     }
 }
 
-/// Subscription provider: spawns the `claude` CLI per turn, fully inert.
+/// Subscription provider: spawns the `agy` CLI per turn, fully inert.
 #[derive(Clone)]
-pub struct ClaudeSubscriptionProvider {
+pub struct AntigravitySubscriptionProvider {
     command: Option<String>,
     model: String,
+    // Kept for API parity with the Claude-subscription provider this was
+    // ported from: full `agy` ids already encode effort, so this is stored
+    // and ignored (never passed as `--effort`, which would conflict).
+    #[allow(dead_code)]
     reasoning_effort: Option<String>,
 }
 
-impl std::fmt::Debug for ClaudeSubscriptionProvider {
+impl std::fmt::Debug for AntigravitySubscriptionProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ClaudeSubscriptionProvider")
+        f.debug_struct("AntigravitySubscriptionProvider")
             .field("model", &self.model)
             .finish_non_exhaustive()
     }
 }
 
-impl ClaudeSubscriptionProvider {
+impl AntigravitySubscriptionProvider {
     pub fn new(
         model: impl Into<String>,
         reasoning_effort: Option<String>,
@@ -519,13 +360,13 @@ impl ClaudeSubscriptionProvider {
         })
     }
 
-    /// The native route id behind the `claude-sub/` prefix (what `native_model`
-    /// resolves to `--model`).
+    /// The native route id behind the `antigravity-sub/` prefix (what
+    /// `native_model` resolves to `--model`).
     pub fn native_model_id(&self) -> &str {
         &self.model
     }
 
-    fn claude_binary(&self) -> Result<String, ProviderError> {
+    fn agy_binary(&self) -> Result<String, ProviderError> {
         if let Some(c) = &self.command
             && !c.is_empty()
         {
@@ -537,282 +378,278 @@ impl ClaudeSubscriptionProvider {
 
 struct Collector {
     text: String,
-    thinking: String,
     calls: Vec<(String, String, String)>,
     usage: Usage,
     stop: StopReason,
-    natives: Vec<Value>,
 }
 
 impl Default for Collector {
     fn default() -> Self {
         Self {
             text: String::new(),
-            thinking: String::new(),
             calls: Vec::new(),
             usage: Usage::default(),
             stop: StopReason::EndTurn,
-            natives: Vec::new(),
         }
     }
 }
 
-/// Feed one native stream-json line; returns a stream event to forward, if any.
-/// `names` is the host tool inventory: a tool outside it is a hard error.
+/// Feed one native stream-json line; returns stream events to forward, if any.
+/// `names` is the host tool inventory: a `finish` call naming a tool outside
+/// it is a hard error. Foreign native tools are ignored (the staged HOME
+/// denies them; only `finish` answers).
 fn feed_line(
     line: &Value,
     names: &[String],
     out: &mut Vec<StreamEvent>,
     col: &mut Collector,
 ) -> Result<(), ProviderError> {
-    let kind = line.get("type").and_then(Value::as_str).unwrap_or("");
+    // Native envelope key is "event" (flat fakes may use "type").
+    let kind = line
+        .get("event")
+        .or_else(|| line.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
     match kind {
-        "assistant" => {
-            if line.get("error").is_some() && line.get("error") != Some(&Value::Null)
-                || line.pointer("/message/error").is_some()
-            {
-                let detail = line
-                    .pointer("/message/content")
-                    .and_then(Value::as_array)
-                    .map(|blocks| {
-                        blocks
-                            .iter()
-                            .filter_map(|b| b.get("text").and_then(Value::as_str))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default();
-                if line.get("error").and_then(Value::as_str) == Some("authentication_failed") {
-                    return Err(ProviderError::Auth(format!(
-                        "Claude Code has no usable login here; run `claude auth login` (native: {detail})"
+        "init" => Ok(()),
+        "step_update" => {
+            let su = line.get("step_update");
+            let step_type = su
+                .and_then(|su| su.get("step_type"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if step_type == "agent_response" {
+                if let Some(t) = su
+                    .and_then(|su| su.get("text_delta"))
+                    .and_then(Value::as_str)
+                    && !t.is_empty()
+                {
+                    // Incremental parity: surface funnel chatter as it lands.
+                    out.push(StreamEvent::text_delta(t));
+                }
+                return Ok(());
+            }
+            if step_type != "tool" {
+                return Ok(());
+            }
+            let tool_name = su
+                .and_then(|su| su.get("tool_name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            // Only `finish` answers the funnel; anything native ran is not
+            // a gray call (staged HOME denies it anyway).
+            if tool_name != "finish" {
+                return Ok(());
+            }
+            let state = su
+                .and_then(|su| su.get("state"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if state != "DONE" {
+                return Ok(());
+            }
+            let params = su
+                .and_then(|su| su.get("tool_info"))
+                .and_then(|ti| ti.get("parameters"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            if params.is_null() {
+                return Ok(());
+            }
+            // One funnel answer per turn: a second finish is a protocol error.
+            if !col.text.is_empty() || !col.calls.is_empty() {
+                return Err(ProviderError::Stream(
+                    "native called finish more than once: single admission violated".into(),
+                ));
+            }
+            let answer = params
+                .get("answer")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            if answer.trim().is_empty() {
+                return Err(ProviderError::Stream(
+                    "incomplete native response: finish carried no answer".into(),
+                ));
+            }
+            col.text = answer.clone();
+            out.push(StreamEvent::text_delta(answer));
+            let wanted = params
+                .get("calls")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            for want in &wanted {
+                let tool = want.get("tool").and_then(Value::as_str).unwrap_or("");
+                if !names.contains(&tool.to_string()) {
+                    return Err(ProviderError::BadRequest(format!(
+                        "native requested a tool outside the current host inventory: {tool:?}"
                     )));
                 }
-                return Err(ProviderError::ServerError(format!(
-                    "native API error: {detail}"
-                )));
+                let call_args = want.get("args").cloned().unwrap_or(json!({}));
+                let args = serde_json::to_string(&call_args).unwrap_or_else(|_| "{}".into());
+                col.calls.push((
+                    format!("call_{}", col.calls.len() + 1),
+                    tool.to_string(),
+                    args.clone(),
+                ));
+                let (id, name) = (col.calls.len() - 1, tool.to_string());
+                out.push(StreamEvent::tool_call_delta(
+                    id,
+                    Some(format!("call_{}", col.calls.len())),
+                    Some(name),
+                    args,
+                ));
             }
-            if let Some(msg) = line.get("message") {
-                col.natives.push(msg.clone());
-                // Incremental parity: surface native text/thinking as it lands
-                // so the turn streams instead of popping in at the end.
-                if let Some(blocks) = msg.get("content").and_then(Value::as_array) {
-                    for b in blocks {
-                        match b.get("type").and_then(Value::as_str) {
-                            Some("text") => {
-                                if let Some(t) = b.get("text").and_then(Value::as_str) {
-                                    col.text.push_str(t);
-                                    out.push(StreamEvent::text_delta(t));
-                                }
-                            }
-                            Some("thinking") => {
-                                if let Some(t) = b.get("thinking").and_then(Value::as_str) {
-                                    col.thinking.push_str(t);
-                                    out.push(StreamEvent::thinking_delta(t));
-                                }
-                            }
-                            Some("tool_use") => {
-                                let id = b
-                                    .get("id")
-                                    .and_then(Value::as_str)
-                                    .unwrap_or("")
-                                    .to_string();
-                                let full = b.get("name").and_then(Value::as_str).unwrap_or("");
-                                let Some(short) = full.strip_prefix(TOOL_PREFIX) else {
-                                    return Err(ProviderError::BadRequest(format!(
-                                        "native returned a tool outside the current host inventory: {full:?}"
-                                    )));
-                                };
-                                if !names.contains(&short.to_string()) {
-                                    return Err(ProviderError::BadRequest(format!(
-                                        "native returned a tool outside the current host inventory: {full:?}"
-                                    )));
-                                }
-                                let input = b.get("input").cloned().unwrap_or(json!({}));
-                                let args =
-                                    serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
-                                col.calls
-                                    .push((id.clone(), short.to_string(), args.clone()));
-                                out.push(StreamEvent::tool_call_delta(
-                                    col.calls.len() - 1,
-                                    Some(id),
-                                    Some(short.to_string()),
-                                    args,
-                                ));
-                            }
-                            _ => {}
-                        }
-                    }
-                }
-            }
-        }
-        "stream_event" => {
-            // Incremental text/thinking already surfaced from the `assistant`
-            // envelope above; partial-message deltas here would double-emit
-            // (reference reconciles emitted-vs-final instead). Track stop only.
-            let ev = line.get("event").cloned().unwrap_or(Value::Null);
-            if ev.get("type").and_then(Value::as_str) == Some("message_stop") {
-                // Assistant + message_stop + one result required at finalize.
-            }
+            Ok(())
         }
         "result" => {
-            if let Some(u) = line.get("usage") {
-                col.usage = map_usage(u);
-            }
-            let subtype = line.get("subtype").and_then(Value::as_str).unwrap_or("");
-            let is_error = line
-                .get("is_error")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            if is_error && subtype != "success" {
-                let detail = line
-                    .get("result")
+            // Two envelope shapes: nested ({result:{status,...}}) from agy,
+            // flat ({status,...}) from minimal fakes — accept both.
+            let flat_status = line.get("status").and_then(Value::as_str);
+            let r = line.get("result");
+            let status = r
+                .and_then(|r| r.get("status"))
+                .and_then(Value::as_str)
+                .or(flat_status)
+                .unwrap_or("");
+            if status != "SUCCESS" {
+                let detail = r
+                    .and_then(|r| r.get("error").or_else(|| r.get("response")))
                     .and_then(Value::as_str)
-                    .unwrap_or(subtype);
-                // error_max_turns with tool calls is the tool boundary, not a
-                // failure — but this CLI has no --max-turns flag, so native
-                // never stops at one turn for us; treat any error result hard.
+                    .or_else(|| {
+                        line.get("error")
+                            .or_else(|| line.get("response"))
+                            .and_then(Value::as_str)
+                    })
+                    .unwrap_or("")
+                    .to_string();
+                if detail.contains("authentication failed or timed out")
+                    || detail.contains("Authentication required")
+                {
+                    return Err(ProviderError::Auth(format!(
+                        "Antigravity CLI has no usable login here; run `agy` once and complete the Google sign-in (native: {detail})"
+                    )));
+                }
+                if detail.contains("Individual quota reached")
+                    || detail.contains("RESOURCE_EXHAUSTED")
+                    || detail.contains("code 429")
+                {
+                    return Err(ProviderError::RateLimited(format!(
+                        "Antigravity quota exhausted (native: {detail})"
+                    )));
+                }
+                if detail.contains("invalid model selection") || detail.contains("conflicts with") {
+                    return Err(ProviderError::BadRequest(format!(
+                        "native request failed: {detail}"
+                    )));
+                }
+                if detail.is_empty() {
+                    return Err(ProviderError::ServerError(
+                        "native request failed (nonzero exit without a success result)".into(),
+                    ));
+                }
                 return Err(ProviderError::ServerError(format!(
                     "native request failed: {detail}"
                 )));
             }
-            match subtype {
-                "success" => col.stop = StopReason::EndTurn,
-                _ if !col.calls.is_empty() => col.stop = StopReason::ToolUse,
-                _ => col.stop = StopReason::EndTurn,
+            if let Some(u) = r.and_then(|r| r.get("usage")).or_else(|| line.get("usage")) {
+                col.usage = map_usage(u);
             }
-            for a in &col.natives {
-                let sr = a.get("stop_reason").and_then(Value::as_str).unwrap_or("");
-                if sr == "max_tokens" || sr == "model_context_window_exceeded" {
-                    col.stop = StopReason::MaxTokens;
-                }
-            }
+            col.stop = if col.calls.is_empty() {
+                StopReason::EndTurn
+            } else {
+                StopReason::ToolUse
+            };
+            Ok(())
         }
-        _ => {}
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 fn run_turn(
-    provider: ClaudeSubscriptionProvider,
+    provider: AntigravitySubscriptionProvider,
     turn: PreparedTurn,
     req: ChatRequest,
-    effort: Option<String>,
 ) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
-    // Fail fast before spawning: conflicting auth env would forward the
-    // subscription bearer somewhere else, or confuse native backend routing.
-    for key in [
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "ANTHROPIC_BASE_URL",
-        "ANTHROPIC_FOUNDRY_API_KEY",
-    ] {
-        if std::env::var_os(key).is_some() {
-            let msg = format!(
-                "subscription provider refuses conflicting {key}: unset it so native uses your Claude login"
-            );
-            return stream::once(async move { Err(ProviderError::Auth(msg)) }).boxed();
-        }
+    // Fail fast before spawning: a gateway override would redirect the
+    // subscription bearer somewhere else.
+    if let Some(key) = setup::conflicting_env() {
+        let msg = format!(
+            "subscription provider refuses conflicting {key}: unset it so native uses your Antigravity login"
+        );
+        return stream::once(async move { Err(ProviderError::Auth(msg)) }).boxed();
     }
-    for key in [
-        "CLAUDE_CODE_USE_BEDROCK",
-        "CLAUDE_CODE_USE_VERTEX",
-        "CLAUDE_CODE_USE_FOUNDRY",
-    ] {
-        if let Some(v) = std::env::var_os(key)
-            && !matches!(
-                v.to_string_lossy().to_lowercase().as_str(),
-                "" | "0" | "false" | "no" | "off"
-            )
-        {
-            let msg = format!(
-                "subscription provider refuses conflicting {key}: unset it so native uses your Claude login"
-            );
-            return stream::once(async move { Err(ProviderError::Auth(msg)) }).boxed();
-        }
-    }
-    let binary = match provider.claude_binary() {
+    let binary = match provider.agy_binary() {
         Ok(b) => b,
         Err(e) => return stream::once(async move { Err(e) }).boxed(),
     };
+    // Same-model gate inputs for the carrier (captured at finalize).
+    let model_for_carrier = provider.model.clone();
     // Per-request staging only; native runs in the real cwd (its env block
     // carries the cwd into the prompt-cache prefix, so a stable cwd keeps
     // the cache warm across turns).
-    let stage = match tempfile::Builder::new().prefix("claude-sub-").tempdir() {
-        Ok(d) => d,
+    let isolation = match chat::TurnIsolation::stage() {
+        Ok(i) => i,
+        Err(e) => {
+            // Missing credential dir reads as auth, not connection.
+            return stream::once(async move { Err(ProviderError::Auth(e)) }).boxed();
+        }
+    };
+    let schema_str = match serde_json::to_string(&turn.schema) {
+        Ok(s) => s,
         Err(e) => {
             return stream::once(async move {
-                Err(ProviderError::Connection(format!("staging dir: {e}")))
+                Err(ProviderError::BadRequest(format!("schema encode: {e}")))
             })
             .boxed();
         }
     };
-    let stage_path = stage.path().to_path_buf();
-    let extra_body = json!({
-        "tools": turn.names.iter().map(|n| {
-            let t = req.tools.iter().find(|t| &t.name == n);
-            json!({"name": format!("{TOOL_PREFIX}{n}"),
-                "description": t.map(|t| t.description.as_str()).unwrap_or(""),
-                "input_schema": t.map(|t| normalize_input_schema(&t.parameters)).unwrap_or(json!({}))})
-        }).collect::<Vec<_>>(),
-    });
-    let write_file = |name: &str, content: &str| -> Result<PathBuf, ProviderError> {
-        let p = stage_path.join(name);
-        std::fs::write(&p, content)
-            .map_err(|e| ProviderError::Connection(format!("staging {name}: {e}")))?;
-        Ok(p)
-    };
-    let settings_path = match write_file(
-        "settings.json",
-        &json!({"env": {"CLAUDE_CODE_EXTRA_BODY": extra_body.to_string()}}).to_string(),
-    ) {
-        Ok(p) => p,
-        Err(e) => return stream::once(async move { Err(e) }).boxed(),
-    };
-    let mcp_config = json!({"mcpServers": {}}).to_string();
-    let mut argv: Vec<String> = vec![
-        "-p".into(),
-        "--model".into(),
-        turn.native_model.clone(),
-        "--input-format".into(),
-        "stream-json".into(),
-        "--output-format".into(),
-        "stream-json".into(),
-        "--verbose".into(),
-        "--include-partial-messages".into(),
-        "--tools".into(),
-        String::new(),
-        "--system-prompt".into(),
-        turn.system.clone(),
-        "--settings".into(),
-        settings_path.to_string_lossy().into_owned(),
-        "--setting-sources".into(),
-        String::new(),
-        "--strict-mcp-config".into(),
-        "--disable-slash-commands".into(),
-        "--permission-mode".into(),
-        "dontAsk".into(),
-        "--no-session-persistence".into(),
-        "--mcp-config".into(),
-        mcp_config,
-    ];
-    if let Some(e) = effort {
-        argv.push("--effort".into());
-        argv.push(e);
-    }
+    let content_line = turn.content_line.clone();
+    let system = turn.system.clone();
+    let native_model = turn.native_model.clone();
+    let names = turn.names.clone();
+    let _ = req;
     // Blocking spawn would stall the loop: run the whole turn on a worker.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<StreamEvent, ProviderError>>();
     let _handle = tokio::task::spawn_blocking(move || {
-        let _stage = stage;
+        let _isolation = isolation;
+        let line = match serde_json::to_string(&json!({"event": "user",
+            "message": {"content": content_line}}))
+        {
+            Ok(l) => l + "\n",
+            Err(e) => {
+                let _ = tx.send(Err(ProviderError::BadRequest(format!("frame encode: {e}"))));
+                return;
+            }
+        };
+        // NOTE: system prompt goes through the funnel content line (agy has
+        // no --system-prompt flag); `system` is kept for the carrier echo.
+        let _ = system;
+        let argv: Vec<String> = vec![
+            "--model".into(),
+            native_model,
+            "--disable-slash-commands".into(),
+            "--input-format".into(),
+            "stream-json".into(),
+            "--output-format".into(),
+            "stream-json".into(),
+            "--json-schema".into(),
+            schema_str,
+            "-p".into(),
+            String::new(),
+        ];
         let mut child = match std::process::Command::new(&binary)
             .args(&argv)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
-            .env("ENABLE_TOOL_SEARCH", "false")
-            .env("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC", "1")
-            .env("DISABLE_AUTO_COMPACT", "1")
-            .env("DISABLE_COMPACT", "1")
-            .env("CLAUDE_CODE_TOTAL_TOKENS_REMINDER", "off")
+            .envs(setup::child_env())
+            .env("HOME", &_isolation.home)
+            .env("XDG_CONFIG_HOME", _isolation.home.join(".config"))
+            .env("XDG_DATA_HOME", _isolation.home.join(".local/share"))
+            .env("XDG_CACHE_HOME", _isolation.home.join(".cache"))
+            .current_dir(&_isolation.cwd)
             .spawn()
         {
             Ok(c) => c,
@@ -821,9 +658,6 @@ fn run_turn(
                 return;
             }
         };
-        // History replay first (no-query frames, one line each), then the
-        // final user/tool-result frame, then close stdin to query.
-        let frames = turn.frames;
         let mut stdin = match child.stdin.take() {
             Some(s) => s,
             None => {
@@ -833,22 +667,9 @@ fn run_turn(
                 return;
             }
         };
-        for (i, frame) in frames.iter().enumerate() {
-            let mut f = frame.clone();
-            if frame.get("type").and_then(Value::as_str) == Some("user") && i + 1 < frames.len() {
-                f["shouldQuery"] = json!(false);
-            }
-            let line = match serde_json::to_string(&f) {
-                Ok(l) => l + "\n",
-                Err(e) => {
-                    let _ = tx.send(Err(ProviderError::BadRequest(format!("frame encode: {e}"))));
-                    return;
-                }
-            };
-            if stdin.write_all(line.as_bytes()).is_err() {
-                let _ = tx.send(Err(ProviderError::Connection("native stdin closed".into())));
-                return;
-            }
+        if stdin.write_all(line.as_bytes()).is_err() {
+            let _ = tx.send(Err(ProviderError::Connection("native stdin closed".into())));
+            return;
         }
         drop(stdin);
         let stdout = match child.stdout.take() {
@@ -863,6 +684,7 @@ fn run_turn(
         let reader = std::io::BufReader::new(stdout);
         let mut col = Collector::default();
         let mut saw_result = false;
+        let mut conversations: HashSet<String> = HashSet::new();
         for line in reader.lines().map_while(Result::ok) {
             let line = line.trim().to_string();
             if line.is_empty() {
@@ -878,11 +700,34 @@ fn run_turn(
                     return;
                 }
             };
-            if v.get("type").and_then(Value::as_str) == Some("result") {
+            // Single-admission audit: exactly one upstream request means
+            // exactly one conversation per turn.
+            let ev = v
+                .get("event")
+                .or_else(|| v.get("type"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            if ev == "init" {
+                let id = v
+                    .get("conversation_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if id.is_empty() {
+                    // Id-less init carries no identity; never trips the audit.
+                } else if !conversations.insert(id) {
+                    let _ = tx.send(Err(ProviderError::Stream(
+                        "native opened more than one conversation: single admission violated"
+                            .into(),
+                    )));
+                    return;
+                }
+            }
+            if ev == "result" {
                 saw_result = true;
             }
             let mut out: Vec<StreamEvent> = Vec::new();
-            if let Err(e) = feed_line(&v, &turn.names, &mut out, &mut col) {
+            if let Err(e) = feed_line(&v, &names, &mut out, &mut col) {
                 let _ = tx.send(Err(e));
                 return;
             }
@@ -894,32 +739,27 @@ fn run_turn(
         }
         let status = child.wait();
         let ok = matches!(status, Ok(s) if s.success());
-        if !saw_result || col.natives.is_empty() {
+        if !saw_result || col.text.is_empty() {
             let _ = tx.send(Err(ProviderError::Stream(
-                "incomplete native response: assistant and one result required".into(),
+                "incomplete native response: finish and one result required".into(),
             )));
             return;
         }
         if !ok {
-            // Nonzero exit with tool calls is the tool boundary only when the
-            // result said so; anything else is a native failure.
+            // Nonzero exit with a finish + result is still a native failure
+            // (quota/auth/model errors surface here when the envelope lacks
+            // a parsable error string).
             let _ = tx.send(Err(ProviderError::ServerError(
                 "native request failed (nonzero exit without a success result)".into(),
             )));
             return;
         }
-        // Finalize: tool calls one delta each were already emitted; attach the
-        // signed carrier so the next turn restores byte-identical frames.
-        // The blob is the full carrier object (type + version + messages +
-        // projection); restore accepts the legacy bare array too.
+        // Finalize: the funnel has no replay carrier (agy has no
+        // assistant-replay event), so emit a versioned marker item for
+        // same-model session continuity instead of byte-identical frames.
         let carrier = json!({"type": NATIVE_ITEM_ID, "version": CARRIER_VERSION,
-            "messages": col.natives,
-            "projection": {"content": col.text.trim(),
-                "tool_calls": col.calls.iter().map(|(id, name, args)| {
-                    let input: Value = serde_json::from_str(args).unwrap_or(json!({}));
-                    json!({"id": id, "name": format!("{TOOL_PREFIX}{name}"), "input": input})
-                }).collect::<Vec<_>>()
-            }
+            "model": model_for_carrier,
+            "answer": col.text.clone(),
         });
         let _ = tx.send(Ok(StreamEvent::ReasoningItem {
             item_id: NATIVE_ITEM_ID.to_string(),
@@ -943,36 +783,22 @@ fn run_turn(
     .boxed()
 }
 
-impl Provider for ClaudeSubscriptionProvider {
+impl Provider for AntigravitySubscriptionProvider {
     fn model_id(&self) -> &str {
         &self.model
     }
 
     fn stream(&self, req: ChatRequest) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
         let model = self.model.clone();
-        // Sampling controls are rejected by subscription models; gray's caller
-        // defaults never reach native. Effort maps to --effort.
-        let effort = self.reasoning_effort.clone().filter(|e| e != "off");
         let turn = match prepare_turn(&req, &model) {
             Ok(t) => t,
             Err(e) => return stream::once(async move { Err(e) }).boxed(),
         };
         let provider = self.clone();
-        run_turn_sync(provider, turn, req, effort)
+        run_turn(provider, turn, req)
     }
 }
 
-fn run_turn_sync(
-    provider: ClaudeSubscriptionProvider,
-    turn: PreparedTurn,
-    req: ChatRequest,
-    effort: Option<String>,
-) -> BoxStream<'static, Result<StreamEvent, ProviderError>> {
-    // The worker owns the whole turn; no await inside, so no block_on
-    // (which would panic on a Tokio worker). Sync all the way down.
-    run_turn(provider, turn, req, effort)
-}
-
-#[path = "claude_subscription_tests.rs"]
+#[path = "direct_provider_tests.rs"]
 #[cfg(test)]
 mod tests;

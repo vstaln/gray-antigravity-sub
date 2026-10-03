@@ -1,16 +1,16 @@
 [package]
-name = "gray-claude-sub"
+name = "gray-antigravity-sub"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Claude subscription provider plugin and direct provider for the gray agent harness"
+description = "Antigravity subscription provider plugin and direct provider for the gray agent harness"
 
 [lib]
-name = "claude_sub"
+name = "antigravity_sub"
 path = "src/lib.rs"
 
 [[bin]]
-name = "claude-sub"
+name = "antigravity-sub"
 path = "src/main.rs"
 
 [dependencies]
