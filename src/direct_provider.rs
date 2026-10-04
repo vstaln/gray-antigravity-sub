@@ -649,6 +649,11 @@ fn run_turn(
             .env("XDG_CONFIG_HOME", _isolation.home.join(".config"))
             .env("XDG_DATA_HOME", _isolation.home.join(".local/share"))
             .env("XDG_CACHE_HOME", _isolation.home.join(".cache"))
+            // A turn must never pop a browser (same neutralization as the
+            // sidecar relay spawn in chat.rs).
+            .env("BROWSER", "/bin/true")
+            .env("DISPLAY", "")
+            .env("WAYLAND_DISPLAY", "")
             .current_dir(&_isolation.cwd)
             .spawn()
         {

@@ -333,6 +333,13 @@ pub fn spawn_turn(
         .env("XDG_CONFIG_HOME", isolation.home.join(".config"))
         .env("XDG_DATA_HOME", isolation.home.join(".local/share"))
         .env("XDG_CACHE_HOME", isolation.home.join(".cache"))
+        // A turn must never pop a browser: stdin is a closed pipe, but a
+        // stale login still prints its OAuth URL, and `agy` calls `xdg-open`
+        // directly (ignores `BROWSER`). With no display and
+        // `BROWSER=/bin/true`, `xdg-open` exits without touching Firefox.
+        .env("BROWSER", "/bin/true")
+        .env("DISPLAY", "")
+        .env("WAYLAND_DISPLAY", "")
         .current_dir(&isolation.cwd)
         .spawn()
         .map_err(|_| setup::INSTALL_HINT.to_string())?;

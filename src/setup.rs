@@ -7,14 +7,19 @@
 //! Login probe design (all verified against `agy` 1.2.16 behaviour):
 //! * `agy models` is unauthenticated (works with an empty HOME), so it only
 //!   proves the binary runs — never login state.
-//! * A `HOME`-isolated `agy -p` run (env `HOME=<empty>`, stdin `/dev/null`,
-//!   stdout discarded) proves login: without credentials `agy` prints its
-//!   Google OAuth URL to stderr and exits nonzero ("authentication failed
-//!   or timed out"); with a login the run succeeds. The probe HOME is
-//!   always empty — never the user's real HOME — so nothing is written to,
-//!   read from, or disturbed in the real credential store either way.
-//! * A short timeout keeps a logged-out machine from hanging on the OAuth
-//!   wait; anything unexpected degrades to "unknown", never to "logged in".
+//! * An empty-`HOME` `agy -p` run can never see the real login (token file at
+//!   `~/.gemini/antigravity-cli/` plus the OS keyring), so it always prints
+//!   the Google OAuth URL, calls `xdg-open` (the stray Firefox window), waits
+//!   out the OAuth timeout and fails — even when the user is logged in. The
+//!   probe therefore stages a fresh HOME holding just a symlink to the token
+//!   file plus the skeleton `settings.json` (the same staging the chat path
+//!   uses, verified to authenticate and answer) — never the real HOME.
+//! * Fail-closed ordering: no token file means logged out with no spawn at
+//!   all (no browser, no wait). Otherwise one lightweight staged-HOME `agy -p`
+//!   run with stdin `/dev/null`, a short timeout, and the browser neutralized
+//!   (`BROWSER=/bin/true` plus empty `DISPLAY`/`WAYLAND_DISPLAY` so `xdg-open`
+//!   can never reach Firefox) confirms the login still answers. Anything
+//!   unexpected degrades to "unknown", never to "logged in".
 
 use std::path::PathBuf;
 
@@ -122,47 +127,91 @@ pub enum LoginState {
     Unknown,
 }
 
-/// Probe login state with a `HOME`-isolated `agy -p` run.
+/// Probe login state with a staged-HOME `agy -p` run.
 ///
-/// The probe HOME is a fresh empty temp dir (never the user's real HOME):
-/// * logged out → `agy` prints its Google OAuth URL and exits nonzero.
-/// * logged in → the run succeeds (exit 0). Success here means the OS
-///   credential store answered — the probe never touches token files.
+/// The probe stages a fresh HOME holding just a symlink to the user's `agy`
+/// OAuth token file plus the skeleton `settings.json` (the same staging the
+/// chat path uses, verified to authenticate and answer) — never the user's
+/// real HOME, so probes write nothing to, read nothing from, and disturb
+/// nothing in the real credential store or conversation history.
+/// * no token file → logged out with no spawn (no browser, no OAuth wait).
+/// * staged run exits 0 → logged in (the OS credential store answered).
+/// * staged run exits nonzero → logged out.
 /// * timeout / spawn failure / anything unexpected → `Unknown`.
 ///
-/// `AGY_SUB_PROBE_TIMEOUT_SECS` overrides the default 45s (tests use 1s…5s).
+/// The browser is neutralized (`BROWSER=/bin/true` plus empty
+/// `DISPLAY`/`WAYLAND_DISPLAY`, stdin `/dev/null`) so a stale login can
+/// never pop a Firefox OAuth page out of a background probe — even though
+/// `agy` calls `xdg-open` directly, `xdg-open` with no display and
+/// `BROWSER=/bin/true` exits without touching Firefox.
+///
+/// `AGY_SUB_PROBE_TIMEOUT_SECS` overrides the default 30s (tests use 1s…5s).
 pub fn probe_login() -> LoginState {
     let binary = match resolve_command() {
         Some(b) => b,
         None => return LoginState::Unknown,
     };
-    let home = match tempfile::Builder::new().prefix("agy-sub-probe-").tempdir() {
-        Ok(d) => d,
+    // No token file: logged out without spawning (and without any browser).
+    // The probe never reads token bytes; it only checks the file exists,
+    // then lets the user's own CLI answer through the staged symlink.
+    let token_src = match crate::chat::credential_file() {
+        Some(path) => path,
+        None => return LoginState::LoggedOut,
+    };
+    let stage = match tempfile::Builder::new()
+        .prefix("agy-sub-probe-")
+        .tempdir()
+    {
+        Ok(stage) => stage,
         Err(_) => return LoginState::Unknown,
     };
-    // `keep` so the empty dir (and any first-run cache `agy` writes there)
-    // outlives the probe and never pollutes the real HOME.
-    let home_path = home.keep();
+    let home = stage.path().to_path_buf();
+    let cli_dir = home.join(".gemini").join("antigravity-cli");
+    if std::fs::create_dir_all(&cli_dir).is_err() {
+        return LoginState::Unknown;
+    }
+    // Stage the token symlink (auth without ever reading token bytes) plus
+    // the skeleton settings.json `agy` needs instead of its defaults.
+    #[cfg(unix)]
+    if std::os::unix::fs::symlink(&token_src, &cli_dir.join("antigravity-oauth-token")).is_err() {
+        return LoginState::Unknown;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = &token_src;
+        return LoginState::Unknown;
+    }
+    if std::fs::write(
+        cli_dir.join("settings.json"),
+        r#"{"toolPermission":"request-review"}"#,
+    )
+    .is_err()
+    {
+        return LoginState::Unknown;
+    }
     let timeout_secs: u64 = std::env::var("AGY_SUB_PROBE_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(45);
+        .unwrap_or(30);
     let mut child = match std::process::Command::new(&binary)
         .args(["--model", "gemini-3.8-flash-low", "-p", "hi"])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .envs(child_env())
-        .env("HOME", &home_path)
-        // No real-HOME fallback for anything `agy` might consult.
-        .env("XDG_CONFIG_HOME", home_path.join("config"))
-        .env("XDG_DATA_HOME", home_path.join("data"))
-        .env("XDG_CACHE_HOME", home_path.join("cache"))
-        // No keyring/agent forwarding into the probe: a "login" here must
-        // come from the machine's own store, not ambient forwarded creds.
-        .env("DBUS_SESSION_BUS_ADDRESS", "disabled")
-        .env("GNOME_KEYRING_CONTROL", "")
-        .env("SSH_AUTH_SOCK", "")
+        // Staged HOME: token symlink (auth) + skeleton settings.json.
+        // Cwd stays the spawner's so the prompt-cache prefix is stable.
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", home.join(".config"))
+        .env("XDG_DATA_HOME", home.join(".local/share"))
+        .env("XDG_CACHE_HOME", home.join(".cache"))
+        // Neutralize the browser so a stale/expired login can never open
+        // Firefox from a background probe: `agy` calls `xdg-open` directly
+        // (ignores `BROWSER`), but `xdg-open` with no display and
+        // `BROWSER=/bin/true` exits without touching Firefox.
+        .env("BROWSER", "/bin/true")
+        .env("DISPLAY", "")
+        .env("WAYLAND_DISPLAY", "")
         .spawn()
     {
         Ok(c) => c,

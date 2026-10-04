@@ -108,7 +108,8 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
                     .unwrap_or_default(),
             )?;
             // External login: the CLI owns credentials. Probe real login
-            // state (HOME-isolated, offline-safe); report where to fix it.
+            // state (staged-HOME `agy -p`, browser neutralized, ~seconds when
+            // logged in); report where to fix it.
             if setup::resolve_command().is_none() {
                 return Err(ProviderRpcError::Unavailable(setup::INSTALL_HINT.into()));
             }
@@ -117,16 +118,16 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
                     "subscription provider refuses conflicting {key}: unset it so native uses your Antigravity login"
                 )));
             }
-            match tokio::task::spawn_blocking(setup::probe_login).await {
-                Ok(setup::LoginState::LoggedIn) => Ok(json!({"status": "authenticated"})),
-                Ok(setup::LoginState::LoggedOut) | Ok(setup::LoginState::Unknown) => {
+            // Sync probe, seconds on a logged-in machine; run it inline
+            // (spawn_blocking needs 'static + Send on the future's captures,
+            // which the borrowed relays map cannot satisfy here).
+            match setup::probe_login() {
+                setup::LoginState::LoggedIn => Ok(json!({"status": "authenticated"})),
+                setup::LoginState::LoggedOut | setup::LoginState::Unknown => {
                     Err(ProviderRpcError::Unavailable(
                         "Antigravity sign-in lives in your terminal: run `agy` once and complete the Google sign-in, then retry.".into(),
                     ))
                 }
-                Err(_) => Err(ProviderRpcError::Unavailable(
-                    "Antigravity sign-in lives in your terminal: run `agy` once and complete the Google sign-in, then retry.".into(),
-                )),
             }
         }
         "provider/auth/poll" => Err(ProviderRpcError::Protocol(
