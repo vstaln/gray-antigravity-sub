@@ -23,7 +23,6 @@ This connector does none of that:
 * **Single-Request Admission Relay**: Drives an internal request-scoped loopback admission relay that enforces exactly one upstream request per turn and absorbs redundant recovery attempts.
 * **Finish Funnel**: Gray tools are described in the system text and answered through a single `finish(answer, calls[])` JSON-schema tool — `agy` never sees a real tool. A turn with no `finish` call is incomplete, never an answer.
 * **Pinned Model Catalog**: Full `agy models` ids (`gemini-3.8-flash-low`, `claude-sonnet-5-5-low`, …) with windows, never guessed (`gpt-oss-120b-medium` reports `None`). Full ids already encode effort, so there is no effort knob.
-* **Dual Integration**: Shipped as both a **standalone protocol-1.2 sidecar binary** (`antigravity-sub`) and an **in-process Rust provider library** (`antigravity_sub::direct_provider`).
 
 ---
 
@@ -134,7 +133,6 @@ The sidecar communicates over standard I/O using newline-delimited JSON (NDJSON)
 │   ├── models.rs            # Provider model metadata
 │   ├── manifest.rs          # Plugin protocol manifest
 │   ├── setup.rs             # CLI dependency discovery and verification
-│   └── direct_provider.rs   # In-process Provider trait implementation
 ```
 
 ---
