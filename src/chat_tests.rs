@@ -20,6 +20,27 @@ fn user_message_becomes_funnel_content() {
 }
 
 #[test]
+fn short_form_user_message_becomes_funnel_content() {
+    // EasyInputMessage short form: the host emits {"role","content"} with
+    // no "type" field; it must still be read as a message.
+    let b = body(vec![json!({"role": "user", "content": "hi"})]);
+    let turn = prepare_turn(&b, "flash").unwrap();
+    assert!(turn.content_line.contains("[User]"));
+    assert!(turn.content_line.contains("hi"));
+}
+
+#[test]
+fn short_form_assistant_then_user_render_both() {
+    let b = body(vec![
+        json!({"role": "assistant", "content": "earlier"}),
+        json!({"role": "user", "content": "next"}),
+    ]);
+    let turn = prepare_turn(&b, "flash").unwrap();
+    assert!(turn.content_line.contains("[Assistant]\nearlier"));
+    assert!(turn.content_line.contains("[User]\nnext"));
+}
+
+#[test]
 fn empty_history_is_rejected() {
     let b = body(vec![]);
     assert!(prepare_turn(&b, "flash").is_err());
@@ -99,6 +120,29 @@ fn fold_rejects_foreign_tools() {
 }
 
 #[test]
+fn fold_reads_finish_from_active_step() {
+    // Current agy puts tool_info.parameters on the ACTIVE tool step and
+    // closes the call with a bare "finish" DONE step.
+    let lines = vec![
+        json!({"event": "init", "conversation_id": "c1",
+            "init": {"model": "gemini-3.8-flash-low", "tools": ["finish"]}}),
+        json!({"event": "step_update", "step_update": {"conversation_id": "c1",
+            "step_index": 1, "state": "ACTIVE", "step_type": "tool",
+            "tool_name": "finish",
+            "tool_info": {"name": "finish",
+                "parameters": {"answer": "hello"}}}}),
+        json!({"event": "step_update", "step_update": {"conversation_id": "c1",
+            "step_index": 1, "state": "DONE", "step_type": "finish"}}),
+        json!({"event": "result", "result": {"conversation_id": "c1",
+            "status": "SUCCESS", "response": "hello",
+            "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+    ];
+    let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
+    let (_, _, text, _, _, _) = fold_lines(&lines, &[], &say).unwrap();
+    assert_eq!(text, "hello");
+}
+
+#[test]
 fn fold_rejects_missing_finish() {
     // Text with no finish call is incomplete: without finish there is no
     // answer and no calls.
@@ -128,17 +172,19 @@ fn fold_maps_quota_to_a_clean_error() {
 
 #[test]
 fn fold_rejects_double_finish() {
-    let fin = || {
+    // Two DISTINCT finish calls violate single admission; identical params
+    // would be the same call re-reported on a later step (an echo).
+    let fin = |answer: &str| {
         json!({"event": "step_update", "step_update": {"conversation_id": "c1",
         "step_index": 1, "state": "DONE", "step_type": "tool",
         "tool_name": "finish",
-        "tool_info": {"name": "finish", "parameters": {"answer": "x"}}}})
+        "tool_info": {"name": "finish", "parameters": {"answer": answer}}}})
     };
     let lines = vec![
         json!({"event": "init", "conversation_id": "c1",
             "init": {"model": "gemini-3.8-flash-low", "tools": ["finish"]}}),
-        fin(),
-        fin(),
+        fin("x"),
+        fin("y"),
         json!({"event": "result", "result": {"conversation_id": "c1",
             "status": "SUCCESS", "response": "x",
             "usage": {"input_tokens": 1, "output_tokens": 1}}}),

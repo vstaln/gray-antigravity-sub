@@ -394,6 +394,69 @@ impl Default for Collector {
     }
 }
 
+/// Fold one `{answer, calls[]}` finish envelope into the collector.
+/// A second distinct finish is a protocol error; identical params are the
+/// same call re-reported on a later step (an echo).
+fn finish_params(
+    params: &Value,
+    names: &[String],
+    col: &mut Collector,
+    out: &mut Vec<StreamEvent>,
+) -> Result<(), ProviderError> {
+    let same = params
+        .get("answer")
+        .and_then(Value::as_str)
+        .is_some_and(|a| a == col.text);
+    if same {
+        return Ok(());
+    }
+    if !col.text.is_empty() || !col.calls.is_empty() {
+        return Err(ProviderError::Stream(
+            "native called finish more than once: single admission violated".into(),
+        ));
+    }
+    let answer = params
+        .get("answer")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    if answer.trim().is_empty() {
+        return Err(ProviderError::Stream(
+            "incomplete native response: finish carried no answer".into(),
+        ));
+    }
+    col.text = answer.clone();
+    out.push(StreamEvent::text_delta(answer));
+    let wanted = params
+        .get("calls")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for want in &wanted {
+        let tool = want.get("tool").and_then(Value::as_str).unwrap_or("");
+        if !names.contains(&tool.to_string()) {
+            return Err(ProviderError::BadRequest(format!(
+                "native requested a tool outside the current host inventory: {tool:?}"
+            )));
+        }
+        let call_args = want.get("args").cloned().unwrap_or(json!({}));
+        let args = serde_json::to_string(&call_args).unwrap_or_else(|_| "{}".into());
+        col.calls.push((
+            format!("call_{}", col.calls.len() + 1),
+            tool.to_string(),
+            args.clone(),
+        ));
+        let (id, name) = (col.calls.len() - 1, tool.to_string());
+        out.push(StreamEvent::tool_call_delta(
+            id,
+            Some(format!("call_{}", col.calls.len())),
+            Some(name),
+            args,
+        ));
+    }
+    Ok(())
+}
+
 /// Feed one native stream-json line; returns stream events to forward, if any.
 /// `names` is the host tool inventory: a `finish` call naming a tool outside
 /// it is a hard error. Foreign native tools are ignored (the staged HOME
@@ -441,13 +504,10 @@ fn feed_line(
             if tool_name != "finish" {
                 return Ok(());
             }
-            let state = su
-                .and_then(|su| su.get("state"))
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            if state != "DONE" {
-                return Ok(());
-            }
+            // The call's parameters ride whichever step_update carries
+            // tool_info: current agy puts them on the ACTIVE tool step and
+            // closes with a bare "finish" DONE step; older builds put them on
+            // the DONE tool step itself. Either way, one logical call.
             let params = su
                 .and_then(|su| su.get("tool_info"))
                 .and_then(|ti| ti.get("parameters"))
@@ -456,54 +516,18 @@ fn feed_line(
             if params.is_null() {
                 return Ok(());
             }
-            // One funnel answer per turn: a second finish is a protocol error.
-            if !col.text.is_empty() || !col.calls.is_empty() {
-                return Err(ProviderError::Stream(
-                    "native called finish more than once: single admission violated".into(),
-                ));
-            }
-            let answer = params
-                .get("answer")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            if answer.trim().is_empty() {
-                return Err(ProviderError::Stream(
-                    "incomplete native response: finish carried no answer".into(),
-                ));
-            }
-            col.text = answer.clone();
-            out.push(StreamEvent::text_delta(answer));
-            let wanted = params
-                .get("calls")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            for want in &wanted {
-                let tool = want.get("tool").and_then(Value::as_str).unwrap_or("");
-                if !names.contains(&tool.to_string()) {
-                    return Err(ProviderError::BadRequest(format!(
-                        "native requested a tool outside the current host inventory: {tool:?}"
-                    )));
-                }
-                let call_args = want.get("args").cloned().unwrap_or(json!({}));
-                let args = serde_json::to_string(&call_args).unwrap_or_else(|_| "{}".into());
-                col.calls.push((
-                    format!("call_{}", col.calls.len() + 1),
-                    tool.to_string(),
-                    args.clone(),
-                ));
-                let (id, name) = (col.calls.len() - 1, tool.to_string());
-                out.push(StreamEvent::tool_call_delta(
-                    id,
-                    Some(format!("call_{}", col.calls.len())),
-                    Some(name),
-                    args,
-                ));
-            }
-            Ok(())
+            finish_params(&params, names, col, out)
         }
         "result" => {
+            // Schema-driven finish: when the model answers as structured
+            // output instead of calling the finish tool, agy auto-closes with
+            // a bare "finish" step and the envelope lands here.
+            if col.text.is_empty()
+                && let Some(so) = line.pointer("/result/structured_output")
+                && !so.is_null()
+            {
+                finish_params(so, names, col, out)?;
+            }
             // Two envelope shapes: nested ({result:{status,...}}) from agy,
             // flat ({status,...}) from minimal fakes — accept both.
             let flat_status = line.get("status").and_then(Value::as_str);
@@ -614,8 +638,15 @@ fn run_turn(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Result<StreamEvent, ProviderError>>();
     let _handle = tokio::task::spawn_blocking(move || {
         let _isolation = isolation;
+        // agy has no --system-prompt flag: the funnel contract + tool
+        // manifest lead the single content line, the transcript follows.
+        let content = if system.is_empty() {
+            content_line
+        } else {
+            format!("{system}\n\n{content_line}")
+        };
         let line = match serde_json::to_string(&json!({"event": "user",
-            "message": {"content": content_line}}))
+            "message": {"content": content}}))
         {
             Ok(l) => l + "\n",
             Err(e) => {
@@ -623,9 +654,6 @@ fn run_turn(
                 return;
             }
         };
-        // NOTE: system prompt goes through the funnel content line (agy has
-        // no --system-prompt flag); `system` is kept for the carrier echo.
-        let _ = system;
         let argv: Vec<String> = vec![
             "--model".into(),
             native_model,

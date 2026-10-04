@@ -99,12 +99,22 @@ fn text_of(blocks: &Value) -> String {
     }
 }
 
+/// Kind of a Responses input item: the `type` field, or "message" for the
+/// EasyInputMessage short form (role present, type absent) the host emits.
+fn item_kind(item: &Value) -> &str {
+    match item.get("type").and_then(Value::as_str) {
+        Some(k) => k,
+        None if item.get("role").is_some() => "message",
+        None => "",
+    }
+}
+
 /// Render one Responses `input` item to transcript text. Tool calls and
 /// results render as explicit records so the model can reference them;
 /// reasoning carriers restore nothing (agy has no replay) but their text
 /// still carries the prior answer.
 fn render_item(item: &Value) -> Option<String> {
-    let kind = item.get("type").and_then(Value::as_str).unwrap_or("");
+    let kind = item_kind(item);
     match kind {
         "message" => {
             let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
@@ -193,11 +203,7 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     // The transcript must end in something the model should answer: a
     // user/assistant message, a tool call, or a tool result. A trailing
     // reasoning item alone answers nothing.
-    let last_kind = input
-        .last()
-        .and_then(|i| i.get("type"))
-        .and_then(Value::as_str)
-        .unwrap_or("");
+    let last_kind = input.last().map(item_kind).unwrap_or("");
     if !matches!(
         last_kind,
         "message" | "function_call" | "function_call_output"
@@ -303,8 +309,15 @@ pub fn spawn_turn(
     let binary = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
     let schema_str =
         serde_json::to_string(&turn.schema).map_err(|e| format!("schema encode: {e}"))?;
+    // agy has no --system-prompt flag: the funnel contract + tool manifest
+    // lead the single content line, the labeled transcript follows.
+    let content = if turn.system.is_empty() {
+        turn.content_line.clone()
+    } else {
+        format!("{}\n\n{}", turn.system, turn.content_line)
+    };
     let line = serde_json::to_string(&json!({"event": "user",
-        "message": {"content": turn.content_line.clone()}}))
+        "message": {"content": content}}))
     .map_err(|e| format!("frame encode: {e}"))?
         + "\n";
     let argv: Vec<String> = vec![
@@ -358,6 +371,26 @@ pub fn spawn_turn(
         .take()
         .ok_or_else(|| "native stdout unavailable".to_string())?;
     let lines = read_lines(stdout, timeout)?;
+    if std::env::var_os("ANTIGRAVITY_SUB_DEBUG").is_some() {
+        let write_600 = |path: &str, data: String| {
+            let mut opts = std::fs::OpenOptions::new();
+            opts.write(true).create(true).truncate(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(0o600);
+            }
+            if let Ok(mut f) = opts.open(path) {
+                let _ = f.write_all(data.as_bytes());
+            }
+        };
+        let dump: String = lines.iter().map(|l| l.to_string() + "\n").collect();
+        write_600("/tmp/antigravity-sub-lines.jsonl", dump);
+        write_600(
+            "/tmp/antigravity-sub-content-line.txt",
+            format!("SYSTEM:\n{}\n\nLINE:\n{}", turn.system, turn.content_line),
+        );
+    }
     let status = child.wait().map_err(|e| format!("native wait: {e}"))?;
     let saw_result = lines.iter().any(|v: &Value| {
         v.get("event")
@@ -568,6 +601,10 @@ pub fn fold_lines(
     }
     let mut usage = Usage::default();
     let mut finish_args: Option<Value> = None;
+    // Schema-driven finish: when the model answers as structured output
+    // instead of calling the finish tool, agy auto-closes with a bare
+    // "finish" step and the envelope lands in result.structured_output.
+    let mut structured: Option<Value> = None;
     let mut conversation: Option<String> = None;
     for line in lines {
         // Native envelope key is "event" (flat fakes may use "type").
@@ -610,13 +647,10 @@ pub fn fold_lines(
                     // retry echo): never a gray call.
                     continue;
                 }
-                let state = su
-                    .and_then(|su| su.get("state"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                if state != "DONE" {
-                    continue;
-                }
+                // The call's parameters ride whichever step_update carries
+                // tool_info: current agy puts them on the ACTIVE tool step and
+                // closes with a bare "finish" DONE step; older builds put them
+                // on the DONE tool step itself. Either way, one logical call.
                 let params = su
                     .and_then(|su| su.get("tool_info"))
                     .and_then(|ti| ti.get("parameters"))
@@ -625,22 +659,33 @@ pub fn fold_lines(
                 if params.is_null() {
                     continue;
                 }
-                if finish_args.is_some() {
-                    return Err(
-                        "native called finish more than once: single admission violated".into(),
-                    );
+                match &finish_args {
+                    // The same call re-reported on a later step is an echo,
+                    // not a second call.
+                    Some(seen) if *seen == params => {}
+                    Some(_) => {
+                        return Err(
+                            "native called finish more than once: single admission violated".into(),
+                        );
+                    }
+                    None => finish_args = Some(params),
                 }
-                finish_args = Some(params);
             }
             "result" => {
                 if let Some(u) = line.pointer("/result/usage").or_else(|| line.get("usage")) {
                     usage = map_usage(u);
+                }
+                if let Some(so) = line.pointer("/result/structured_output")
+                    && !so.is_null()
+                {
+                    structured = Some(so.clone());
                 }
             }
             _ => {}
         }
     }
     let args = finish_args
+        .or(structured)
         .ok_or_else(|| "incomplete native response: finish was never called".to_string())?;
     // The schema envelopes the answer; a schema-less `response` string is
     // the fallback (older CLI shape). Either way the answer is required.
@@ -715,6 +760,13 @@ pub fn fold_lines(
                 "output_index": item_id - 1,
                 "item_id": format!("fc_{item_id}"), "call_id": id,
                 "name": name, "arguments": args}),
+        );
+        emit(
+            &mut sse,
+            &json!({"type": "response.output_item.done",
+                "output_index": item_id - 1,
+                "item": {"type": "function_call", "id": format!("fc_{item_id}"),
+                    "call_id": id, "name": name, "arguments": args}}),
         );
     }
     emit(
