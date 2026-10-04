@@ -69,7 +69,7 @@ pub fn provider() -> ProviderDecl {
             id: AUTH_METHOD_ID.to_string(),
             name: "Antigravity CLI sign-in".to_string(),
             kind: "api_key".to_string(),
-            operations: vec!["models".to_string()],
+            operations: vec!["models".to_string(), "chat".to_string()],
         }],
     }
 }
