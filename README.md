@@ -55,16 +55,17 @@ The resulting binary is located at `./target/release/antigravity-sub`.
 
 ### Installing in Gray
 
-Point Gray to the binary or install it directly into `$GRAY_HOME/plugins` (default `~/.gray/plugins`):
+Register the binary with Gray, either by pointing `GRAY_PLUGIN_PATH` at the executable or by putting it on `PATH` as `gray-antigravity-sub`:
 
 ```sh
-# Copy binary to your Gray plugin directory
-mkdir -p ~/.gray/plugins/antigravity-sub
-cp target/release/antigravity-sub ~/.gray/plugins/antigravity-sub/antigravity-sub
+GRAY_PLUGIN_PATH="$PWD/target/release/antigravity-sub" gray install plugin antigravity-sub
 
-# Or install via gray plugin management
+# or
+cp target/release/antigravity-sub ~/.local/bin/gray-antigravity-sub
 gray install plugin antigravity-sub
 ```
+
+Run the install from an interactive terminal and approve the `provider.credentials` capability.
 
 Sign in with Antigravity if you haven't already:
 
@@ -77,7 +78,7 @@ agy
 
 ## Model Selection
 
-Once registered, Antigravity subscription models appear under the `antigravity-sub/` prefix:
+Once registered, run `/connect` in Gray and pick **Antigravity subscription**. Then choose a model:
 
 ```sh
 # Select model in interactive mode
@@ -86,8 +87,8 @@ Once registered, Antigravity subscription models appear under the `antigravity-s
 /model antigravity-sub/opus
 /model antigravity-sub/pro
 
-# Or launch directly with Gray CLI
-gray -m antigravity-sub/flash -p "Review this codebase"
+# Or launch directly with Gray CLI (after /connect)
+gray --model antigravity-sub/flash -p "Review this codebase"
 ```
 
 ### Pinned Model Catalog
