@@ -85,17 +85,27 @@ pub fn display_name(id: &str) -> String {
     let canon = canonical(id);
     let short = canon.replace('-', " ");
     // Title-case each word without pulling in a dependency.
-    let titled = short
-        .split_whitespace()
-        .map(|w| {
-            let mut c = w.chars();
-            match c.next() {
-                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
-                None => String::new(),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
+    // `5-5` in a claude id is `5.5` upstream: a lone digit folds onto a
+    // digit-ending word. (`3.8` gemini ids already carry real dots.)
+    let mut words: Vec<String> = Vec::new();
+    for w in short.split_whitespace() {
+        let lone_digit = w.len() == 1 && w.bytes().next().is_some_and(|b| b.is_ascii_digit());
+        if lone_digit
+            && words
+                .last()
+                .is_some_and(|p: &String| p.ends_with(|c: char| c.is_ascii_digit()))
+        {
+            words.last_mut().unwrap().push('.');
+            words.last_mut().unwrap().push_str(w);
+            continue;
+        }
+        let mut c = w.chars();
+        words.push(match c.next() {
+            Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+            None => String::new(),
+        });
+    }
+    let titled = words.join(" ");
     if context_windows().iter().any(|(known, _)| *known == canon) {
         format!("{titled} (Antigravity)")
     } else {
