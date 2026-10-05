@@ -158,10 +158,7 @@ pub fn probe_login() -> LoginState {
         Some(path) => path,
         None => return LoginState::LoggedOut,
     };
-    let stage = match tempfile::Builder::new()
-        .prefix("agy-sub-probe-")
-        .tempdir()
-    {
+    let stage = match tempfile::Builder::new().prefix("agy-sub-probe-").tempdir() {
         Ok(stage) => stage,
         Err(_) => return LoginState::Unknown,
     };
