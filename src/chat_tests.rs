@@ -47,6 +47,31 @@ fn empty_history_is_rejected() {
 }
 
 #[test]
+fn usage_reports_cache_reads() {
+    // Native `result.usage` shape: flat counts, cache reads outside input.
+    let lines = vec![
+        json!({"event": "step_update", "step_update": {"conversation_id": "c1",
+            "step_index": 0, "state": "DONE", "step_type": "agent_response",
+            "text_delta": "hello"}}),
+        json!({"event": "step_update", "step_update": {"conversation_id": "c1",
+            "step_index": 1, "state": "DONE", "step_type": "tool",
+            "tool_name": "finish",
+            "tool_info": {"name": "finish", "parameters": {"answer": "hello"}}}}),
+        json!({"event": "result", "result": {"conversation_id": "c1",
+            "status": "SUCCESS", "response": "hello",
+            "usage": {"cache_read_tokens": 20000, "input_tokens": 2184,
+                "output_tokens": 65, "thinking_tokens": 5, "total_tokens": 22254}}}),
+    ];
+    let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
+    let (sse, _, _, _, usage, _) = fold_lines(&lines, &[], &say).unwrap();
+    assert_eq!(usage.input_tokens, 22184);
+    assert_eq!(usage.cached_tokens, 20000);
+    assert_eq!(usage.output_tokens, 70);
+    let s = String::from_utf8(sse).unwrap();
+    assert!(s.contains("\"cached_tokens\":20000"));
+}
+
+#[test]
 fn fold_emits_valid_responses_sse() {
     let lines = vec![
         json!({"event": "init", "conversation_id": "c1",

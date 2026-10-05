@@ -783,7 +783,8 @@ pub fn fold_lines(
     let natives: Vec<Value> = Vec::new();
     let usage_val = json!({"input_tokens": usage.input_tokens,
         "output_tokens": usage.output_tokens,
-        "total_tokens": usage.input_tokens + usage.output_tokens});
+        "total_tokens": usage.input_tokens + usage.output_tokens,
+        "input_tokens_details": {"cached_tokens": usage.cached_tokens}});
     emit(
         &mut sse,
         &json!({"type": "response.completed",
@@ -816,6 +817,9 @@ fn conversation_of(line: &Value) -> String {
 pub struct Usage {
     pub input_tokens: usize,
     pub output_tokens: usize,
+    /// `cache_read_tokens` — a subset of `input_tokens`. Native reports
+    /// no cache writes.
+    pub cached_tokens: usize,
 }
 
 pub fn map_usage(u: &Value) -> Usage {
@@ -832,6 +836,7 @@ pub fn map_usage(u: &Value) -> Usage {
     Usage {
         input_tokens: input.saturating_add(read),
         output_tokens: output.saturating_add(thinking),
+        cached_tokens: read,
     }
 }
 

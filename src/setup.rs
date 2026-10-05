@@ -147,10 +147,6 @@ pub enum LoginState {
 ///
 /// `AGY_SUB_PROBE_TIMEOUT_SECS` overrides the default 30s (tests use 1s…5s).
 pub fn probe_login() -> LoginState {
-    let binary = match resolve_command() {
-        Some(b) => b,
-        None => return LoginState::Unknown,
-    };
     // No token file: logged out without spawning (and without any browser).
     // The probe never reads token bytes; it only checks the file exists,
     // then lets the user's own CLI answer through the staged symlink.
@@ -158,10 +154,11 @@ pub fn probe_login() -> LoginState {
         Some(path) => path,
         None => return LoginState::LoggedOut,
     };
-    let stage = match tempfile::Builder::new()
-        .prefix("agy-sub-probe-")
-        .tempdir()
-    {
+    let binary = match resolve_command() {
+        Some(b) => b,
+        None => return LoginState::Unknown,
+    };
+    let stage = match tempfile::Builder::new().prefix("agy-sub-probe-").tempdir() {
         Ok(stage) => stage,
         Err(_) => return LoginState::Unknown,
     };
@@ -173,7 +170,7 @@ pub fn probe_login() -> LoginState {
     // Stage the token symlink (auth without ever reading token bytes) plus
     // the skeleton settings.json `agy` needs instead of its defaults.
     #[cfg(unix)]
-    if std::os::unix::fs::symlink(&token_src, &cli_dir.join("antigravity-oauth-token")).is_err() {
+    if std::os::unix::fs::symlink(&token_src, cli_dir.join("antigravity-oauth-token")).is_err() {
         return LoginState::Unknown;
     }
     #[cfg(not(unix))]
