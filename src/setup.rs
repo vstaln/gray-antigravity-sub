@@ -147,16 +147,16 @@ pub enum LoginState {
 ///
 /// `AGY_SUB_PROBE_TIMEOUT_SECS` overrides the default 30s (tests use 1s…5s).
 pub fn probe_login() -> LoginState {
-    let binary = match resolve_command() {
-        Some(b) => b,
-        None => return LoginState::Unknown,
-    };
     // No token file: logged out without spawning (and without any browser).
     // The probe never reads token bytes; it only checks the file exists,
     // then lets the user's own CLI answer through the staged symlink.
     let token_src = match crate::chat::credential_file() {
         Some(path) => path,
         None => return LoginState::LoggedOut,
+    };
+    let binary = match resolve_command() {
+        Some(b) => b,
+        None => return LoginState::Unknown,
     };
     let stage = match tempfile::Builder::new().prefix("agy-sub-probe-").tempdir() {
         Ok(stage) => stage,
