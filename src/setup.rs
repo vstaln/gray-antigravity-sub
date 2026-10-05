@@ -170,7 +170,7 @@ pub fn probe_login() -> LoginState {
     // Stage the token symlink (auth without ever reading token bytes) plus
     // the skeleton settings.json `agy` needs instead of its defaults.
     #[cfg(unix)]
-    if std::os::unix::fs::symlink(&token_src, &cli_dir.join("antigravity-oauth-token")).is_err() {
+    if std::os::unix::fs::symlink(&token_src, cli_dir.join("antigravity-oauth-token")).is_err() {
         return LoginState::Unknown;
     }
     #[cfg(not(unix))]
