@@ -138,11 +138,13 @@ enum Verdict {
 }
 
 fn verdict(idle: Duration, warm_idle: Duration, disabled: bool) -> Verdict {
-    if disabled {
-        return Verdict::Keep;
-    }
+    // The cap comes first: a disabled entry still holds a staged HOME that
+    // only a drop frees.
     if warm_idle > WARM_FOR {
         return Verdict::Drop;
+    }
+    if disabled {
+        return Verdict::Keep;
     }
     if idle >= KEEPALIVE_EVERY {
         Verdict::Refresh
