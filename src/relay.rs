@@ -77,6 +77,7 @@ fn handle_conn(
     let request_line = lines.next().unwrap_or("").to_string();
     let mut len = 0usize;
     let mut auth = String::new();
+    let mut session = String::new();
     for line in lines {
         let line = line.trim_end();
         if line.is_empty() {
@@ -92,6 +93,11 @@ fn handle_conn(
             .or_else(|| line.strip_prefix("authorization:"))
         {
             auth = v.trim().to_string();
+        } else if let Some(v) = line
+            .strip_prefix("Session-Id:")
+            .or_else(|| line.strip_prefix("session-id:"))
+        {
+            session = v.trim().to_string();
         }
     }
     let header_end = head
@@ -124,7 +130,7 @@ fn handle_conn(
         return;
     }
     // Admitted: the one request. Translate, spawn, fold, stream.
-    match run_turn(intents, bearer, &body) {
+    match run_turn(intents, bearer, &body, &session) {
         Ok(sse) => {
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
@@ -143,7 +149,7 @@ fn handle_conn(
     }
 }
 
-fn run_turn(intents: &Intents, bearer: &str, raw: &[u8]) -> Result<Vec<u8>, String> {
+fn run_turn(intents: &Intents, bearer: &str, raw: &[u8], session: &str) -> Result<Vec<u8>, String> {
     let intent = intents
         .lock()
         .map(|mut m| m.remove(bearer))
@@ -163,9 +169,16 @@ fn run_turn(intents: &Intents, bearer: &str, raw: &[u8]) -> Result<Vec<u8>, Stri
         .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
         .collect();
     // Staged HOME + single funnel line: native makes exactly one upstream
-    // request on its own.
+    // request on its own. The keepalive wraps the spawn: it retains the
+    // turn + staged HOME under the session's serialization gate and
+    // replays it when the session idles near the implicit-cache TTL.
     let isolation = crate::chat::TurnIsolation::stage()?;
-    let lines = crate::chat::spawn_turn(&turn, &isolation, std::time::Duration::from_secs(300))?;
+    let lines = crate::keepalive::run_real_turn(
+        session,
+        turn,
+        isolation,
+        std::time::Duration::from_secs(300),
+    )?;
     let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
     let (sse, _, _, _, _, _) = crate::chat::fold_lines(&lines, &names, &say)?;
     Ok(sse)
