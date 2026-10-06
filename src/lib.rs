@@ -3,6 +3,7 @@
 
 pub mod catalog;
 pub mod chat;
+pub mod keepalive;
 pub mod manifest;
 pub mod models;
 pub mod relay;
