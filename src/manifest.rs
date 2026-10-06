@@ -6,7 +6,7 @@ use gray_plugin::{
 };
 
 pub const PLUGIN_NAME: &str = "antigravity-sub";
-pub const PLUGIN_VERSION: &str = "0.1.0";
+pub const PLUGIN_VERSION: &str = "0.1.1";
 pub const PROVIDER_ID: &str = "antigravity-subscription";
 pub const AUTH_METHOD_ID: &str = "antigravity-login";
 
