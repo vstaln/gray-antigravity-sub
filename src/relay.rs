@@ -43,6 +43,8 @@ pub fn start_turn_server(
     Ok((port, handle))
 }
 
+const MAX_BODY: usize = 256 << 20;
+
 fn serve(listener: TcpListener, intents: Intents, bearer: String, used: Arc<AtomicBool>) {
     for stream in listener.incoming() {
         let Ok(mut s) = stream else { continue };
@@ -83,20 +85,14 @@ fn handle_conn(
         if line.is_empty() {
             break;
         }
-        if let Some(v) = line
-            .strip_prefix("Content-Length:")
-            .or_else(|| line.strip_prefix("content-length:"))
-        {
+        let Some((name, v)) = line.split_once(':') else {
+            continue;
+        };
+        if name.eq_ignore_ascii_case("content-length") {
             len = v.trim().parse().unwrap_or(0);
-        } else if let Some(v) = line
-            .strip_prefix("Authorization:")
-            .or_else(|| line.strip_prefix("authorization:"))
-        {
+        } else if name.eq_ignore_ascii_case("authorization") {
             auth = v.trim().to_string();
-        } else if let Some(v) = line
-            .strip_prefix("Session-Id:")
-            .or_else(|| line.strip_prefix("session-id:"))
-        {
+        } else if name.eq_ignore_ascii_case("session-id") {
             session = v.trim().to_string();
         }
     }
@@ -106,7 +102,8 @@ fn handle_conn(
         .map(|i| i + 4)
         .unwrap_or(head.len());
     let mut body = head[header_end..].to_vec();
-    while body.len() < len.min(8_388_608) {
+    // Image-heavy histories run past 8 MiB; read the whole declared body.
+    while body.len() < len.min(MAX_BODY) {
         let Ok(n) = s.read(&mut buf) else { return };
         if n == 0 {
             break;
@@ -119,6 +116,18 @@ fn handle_conn(
     let ok_bearer = auth == format!("Bearer {bearer}");
     if !ok_path || !ok_bearer {
         write_resp(s, 404, b"not found");
+        return;
+    }
+    if len > MAX_BODY || body.len() < len {
+        let body = json!({"type": "error", "error": {
+            "type": "invalid_request_error",
+            "message": format!("relay body incomplete: read {} of {len} bytes (limit {MAX_BODY})", body.len()),
+        }});
+        write_resp(
+            s,
+            if len > MAX_BODY { 413 } else { 400 },
+            body.to_string().as_bytes(),
+        );
         return;
     }
     if used.swap(true, Ordering::SeqCst) {
@@ -156,8 +165,8 @@ fn run_turn(intents: &Intents, bearer: &str, raw: &[u8], session: &str) -> Resul
         .ok()
         .flatten()
         .ok_or_else(|| "relay intent expired".to_string())?;
-    let body: Value =
-        serde_json::from_slice(raw).map_err(|_| "relay body is not JSON".to_string())?;
+    let body: Value = serde_json::from_slice(raw)
+        .map_err(|e| format!("relay body is not JSON ({} bytes): {e}", raw.len()))?;
     let turn = crate::chat::prepare_turn(&body, &intent.model)?;
     let tools: Vec<Value> = body
         .get("tools")
@@ -187,6 +196,7 @@ fn run_turn(intents: &Intents, bearer: &str, raw: &[u8], session: &str) -> Resul
 fn write_resp(s: &mut std::net::TcpStream, status: u16, body: &[u8]) {
     let reason = match status {
         400 => "Bad Request",
+        413 => "Payload Too Large",
         404 => "Not Found",
         _ => "Error",
     };
