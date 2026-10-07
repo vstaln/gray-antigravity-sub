@@ -1,12 +1,18 @@
-//! One-shot chat turn over the loopback relay: the OpenAI Responses body the
-//! host POSTs becomes ONE `agy` print-mode run whose only tool is `finish`.
+//! Chat turn over the loopback relay: the OpenAI Responses body the host
+//! POSTs is answered by a pooled `agy` print-mode child (see
+//! [`crate::live`]) — one persistent process per conversation, one NDJSON
+//! funnel line per turn.
 //!
-//! The funnel contract (all verified against `agy` 1.2.16 behaviour):
-//! * history frames collapse into a single `{"event":"user",
-//!   "message":{"content": ...}}` line — one upstream request per turn, and
-//!   `agy` has no assistant-replay event (fabricated `{"event":"assistant"}`
-//!   lines are ignored with a warning), so byte-identical replay is
-//!   impossible; the transcript is re-derived every turn instead.
+//! The funnel contract (all verified against `agy` behaviour — the
+//! multi-turn parts re-verified on 1.3.1):
+//! * history frames collapse into `{"event":"user","message":{"content":
+//!   ...}}` lines — one upstream request per turn. `agy` has no
+//!   assistant-replay event (fabricated `{"event":"assistant"}` lines are
+//!   ignored with a warning), so byte-identical replay is impossible; the
+//!   transcript is re-derived for a cold spawn instead. Verified: context
+//!   persists across stdin lines in one process (same conversation_id,
+//!   earlier content is recalled), so a pooled session continuing a
+//!   history receives only the delta — see [`continuation`].
 //! * gray tools are NOT passed as native tools. They are described in the
 //!   system text and the `finish` JSON schema's `calls[]` array; `agy`
 //!   calls `finish(answer, calls)` once and gray executes the calls itself.
@@ -21,7 +27,9 @@
 //!   ran under the user's real HOME with its own allow-rules). Native tools
 //!   can neither execute nor exfiltrate; `finish` stays callable because it
 //!   needs no permission. A skeleton file is required: `agy` ignores an
-//!   absent settings.json and falls back to defaults.
+//!   absent settings.json and falls back to defaults. One staged HOME now
+//!   serves the whole conversation — staging happens once per session,
+//!   not per turn.
 //!
 //! The relay speaks the OpenAI Responses SSE wire the host already streams,
 //! so no host changes are needed: the declared transport points at the
@@ -29,7 +37,6 @@
 //! per-turn bearer.
 
 use std::collections::HashSet;
-use std::io::Write;
 use std::sync::Arc;
 
 use serde_json::{Value, json};
@@ -43,6 +50,8 @@ pub const ADMISSION_CONSUMED: &str = "ANTIGRAVITY_MODEL_ADMISSION_CONSUMED";
 pub struct PreparedTurn {
     pub system: String,
     pub content_line: String,
+    /// The request's raw `input` array: continuation matching keys off it.
+    pub input: Vec<Value>,
     pub schema: Value,
     pub names: Vec<String>,
     pub native_model: String,
@@ -169,6 +178,15 @@ fn render_item(item: &Value) -> Option<String> {
     }
 }
 
+/// Render a Responses `input` array to transcript text.
+fn render_items(items: &[Value]) -> String {
+    items
+        .iter()
+        .filter_map(render_item)
+        .collect::<Vec<_>>()
+        .join("\n\n")
+}
+
 /// Translate an OpenAI Responses body into one funnel turn.
 pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     let instructions = body
@@ -213,13 +231,8 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
                 .into(),
         );
     }
-    let mut parts: Vec<String> = Vec::new();
-    for item in &input {
-        if let Some(text) = render_item(item) {
-            parts.push(text);
-        }
-    }
-    if parts.is_empty() {
+    let transcript = render_items(&input);
+    if transcript.is_empty() {
         return Err("history must end in a nonempty user/tool-result message".into());
     }
     // Assistant prefill (trailing assistant message, no tool result after
@@ -235,7 +248,6 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
                 .into(),
         );
     }
-    let transcript = parts.join("\n\n");
     // Tool manifest for the system text: name + description + schema.
     let mut tool_specs: Vec<String> = Vec::new();
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
@@ -256,7 +268,9 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     system_parts.push(
         "You are a model provider inside the gray agent harness. You have exactly one tool: finish. \
         You have NO other tools - never call any native tool for any reason. Gray owns all tools, approvals, and the filesystem. \
-        To use a gray tool, list it in the calls array with its name and args object, and put your reply text in answer."
+        To use a gray tool, list it in the calls array with its name and args object, and put your reply text in answer. \
+        Later messages in this conversation come from gray too: tool results arrive as `[Tool result id=…]` records \
+        and new user input as `[User]` records — always answer the latest."
             .to_string(),
     );
     if !tool_specs.is_empty() {
@@ -288,163 +302,96 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     Ok(PreparedTurn {
         system: system_parts.join("\n\n"),
         content_line: transcript,
+        input,
         schema,
         names,
         native_model: crate::catalog::native_model(model),
     })
 }
 
-/// Spawn `agy` for one turn: a single funnel line on stdin, `--json-schema`
-/// forcing the `{answer, calls[]}` envelope. Returns native stream-json lines.
-pub fn spawn_turn(
-    turn: &PreparedTurn,
-    isolation: &TurnIsolation,
-    timeout: std::time::Duration,
-) -> Result<Vec<Value>, String> {
-    if let Some(key) = setup::conflicting_env() {
-        return Err(format!(
-            "subscription provider refuses conflicting {key}: unset it so native uses your Antigravity login"
-        ));
+/// An input item the assistant side produced: the replayed echo of a
+/// session's own answer (assistant message, its calls, reasoning carriers).
+fn assistant_side(item: &Value) -> bool {
+    match item_kind(item) {
+        "function_call" | "reasoning" => true,
+        "message" => item.get("role").and_then(Value::as_str) == Some("assistant"),
+        _ => false,
     }
-    let binary = setup::resolve_command().ok_or_else(|| setup::INSTALL_HINT.to_string())?;
-    let schema_str =
-        serde_json::to_string(&turn.schema).map_err(|e| format!("schema encode: {e}"))?;
-    // agy has no --system-prompt flag: the funnel contract + tool manifest
-    // lead the single content line, the labeled transcript follows.
-    let content = if turn.system.is_empty() {
-        turn.content_line.clone()
-    } else {
-        format!("{}\n\n{}", turn.system, turn.content_line)
-    };
-    let line = serde_json::to_string(&json!({"event": "user",
-        "message": {"content": content}}))
-    .map_err(|e| format!("frame encode: {e}"))?
-        + "\n";
-    let argv: Vec<String> = vec![
-        "--model".into(),
-        turn.native_model.clone(),
-        "--disable-slash-commands".into(),
-        "--input-format".into(),
-        "stream-json".into(),
-        "--output-format".into(),
-        "stream-json".into(),
-        "--json-schema".into(),
-        schema_str,
-        "-p".into(),
-        String::new(),
-    ];
-    let mut child = std::process::Command::new(&binary)
-        .args(&argv)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::null())
-        .envs(setup::child_env())
-        // Staged HOME: token symlink (auth) + skeleton settings.json
-        // (toolPermission request-review). Cwd stays the real one so the
-        // prompt-cache prefix is stable across turns.
-        .env("HOME", &isolation.home)
-        .env("XDG_CONFIG_HOME", isolation.home.join(".config"))
-        .env("XDG_DATA_HOME", isolation.home.join(".local/share"))
-        .env("XDG_CACHE_HOME", isolation.home.join(".cache"))
-        // A turn must never pop a browser: stdin is a closed pipe, but a
-        // stale login still prints its OAuth URL, and `agy` calls `xdg-open`
-        // directly (ignores `BROWSER`). With no display and
-        // `BROWSER=/bin/true`, `xdg-open` exits without touching Firefox.
-        .env("BROWSER", "/bin/true")
-        .env("DISPLAY", "")
-        .env("WAYLAND_DISPLAY", "")
-        .current_dir(&isolation.cwd)
-        .spawn()
-        .map_err(|_| setup::INSTALL_HINT.to_string())?;
-    {
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "native stdin unavailable".to_string())?;
-        stdin
-            .write_all(line.as_bytes())
-            .map_err(|_| "native stdin closed".to_string())?;
-        // Close stdin: exactly one funnel line = exactly one upstream request.
-    }
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| "native stdout unavailable".to_string())?;
-    let lines = match read_lines(stdout, timeout) {
-        Ok(l) => l,
-        Err(e) => {
-            // Never leave a timed-out native run holding the staged HOME
-            // or still burning a quota window against it.
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e);
-        }
-    };
-    if std::env::var_os("ANTIGRAVITY_SUB_DEBUG").is_some() {
-        let write_600 = |path: &str, data: String| {
-            let mut opts = std::fs::OpenOptions::new();
-            opts.write(true).create(true).truncate(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                opts.mode(0o600);
-            }
-            if let Ok(mut f) = opts.open(path) {
-                let _ = f.write_all(data.as_bytes());
-            }
-        };
-        let dump: String = lines.iter().map(|l| l.to_string() + "\n").collect();
-        write_600("/tmp/antigravity-sub-lines.jsonl", dump);
-        write_600(
-            "/tmp/antigravity-sub-content-line.txt",
-            format!("SYSTEM:\n{}\n\nLINE:\n{}", turn.system, turn.content_line),
-        );
-    }
-    let status = child.wait().map_err(|e| format!("native wait: {e}"))?;
-    let saw_result = lines.iter().any(|v: &Value| {
-        v.get("event")
-            .or_else(|| v.get("type"))
-            .and_then(Value::as_str)
-            == Some("result")
-    });
-    if !saw_result {
-        return Err("incomplete native response: one result required".into());
-    }
-    if !status.success() {
-        // `agy` usually emits a result envelope on failure (quota, model
-        // errors): surface its message rather than a bare exit code. When
-        // it emits nothing (hard quota wall), say so explicitly — stderr
-        // stays null so token-adjacent diagnostics never leak.
-        let detail = lines
-            .iter()
-            .rev()
-            .filter(|v: &&Value| {
-                v.get("event")
-                    .or_else(|| v.get("type"))
-                    .and_then(Value::as_str)
-                    == Some("result")
-            })
-            .filter_map(|v| v.get("result"))
-            .filter_map(|r| r.get("error").or_else(|| r.get("response")))
-            .filter_map(Value::as_str)
-            .find(|s| !s.is_empty());
-        match detail {
-            Some(d) => return Err(d.to_string()),
-            None => {
-                return Err("native request failed with no result envelope (usually an exhausted Antigravity quota wall); retry after the reset window"
-                    .to_string())
-            }
-        }
-    }
-    Ok(lines)
 }
 
-/// Per-turn isolation: a staged HOME (token symlink + skeleton
+/// Prepended to a continuation delta whose previous reply never reached
+/// the host.
+pub(crate) const UNDELIVERED_NOTE: &str = "[Harness note] Your previous reply was interrupted and never delivered; none of its tool calls ran.";
+
+/// Strict-continuation check: `input` is `absorbed` plus the echo of the
+/// session's own last answer plus a non-assistant tail. Returns the tail
+/// rendered to transcript text — the only thing the session still needs
+/// to see (the conversation context persists upstream in the pooled
+/// child). Miss reasons feed the ANTIGRAVITY_SUB_DEBUG trace: `prefix`
+/// (history diverged), `echo` (the replayed answer isn't what this session
+/// sent), `empty_delta` (nothing new to ask, or an assistant item sits in
+/// the new tail, which means the history mid-edited a turn).
+///
+/// The host echoes our answer as `{"role":"assistant","content":<text>}`
+/// (only when the text is non-empty) then one `{"type":"function_call",...}`
+/// item per call; reasoning items may interleave and carry nothing here.
+pub(crate) fn continuation(
+    absorbed: &[Value],
+    reply_call_ids: &[String],
+    reply_text: &str,
+    input: &[Value],
+) -> Result<String, &'static str> {
+    if input.len() <= absorbed.len() || !input.starts_with(absorbed) {
+        return Err("prefix");
+    }
+    let rest = &input[absorbed.len()..];
+    let mut i = 0;
+    let mut call_ids: Vec<String> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    while i < rest.len() && assistant_side(&rest[i]) {
+        let item = &rest[i];
+        match item_kind(item) {
+            "function_call" => call_ids.push(
+                item.get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ),
+            "message" => texts.push(text_of(item.get("content").unwrap_or(&Value::Null))),
+            _ => {}
+        }
+        i += 1;
+    }
+    // An empty echo zone against a non-empty recorded reply: the reply
+    // never reached gray (interrupted turn, relay client gone before
+    // delivery). The child still holds it, so continue with a note
+    // instead of re-billing the whole prefix on a fresh session.
+    let undelivered = i == 0 && (!reply_call_ids.is_empty() || !reply_text.trim().is_empty());
+    if !undelivered
+        && (call_ids.as_slice() != reply_call_ids || texts.join("\n").trim() != reply_text.trim())
+    {
+        return Err("echo");
+    }
+    let tail = &rest[i..];
+    if tail.is_empty() || tail.iter().any(assistant_side) {
+        return Err("empty_delta");
+    }
+    let delta = render_items(tail);
+    if delta.trim().is_empty() {
+        return Err("empty_delta");
+    }
+    if undelivered {
+        return Ok(format!("{UNDELIVERED_NOTE}\n\n{delta}"));
+    }
+    Ok(delta)
+}
+
+/// Per-session isolation: a staged HOME (token symlink + skeleton
 /// settings.json) plus the real cwd for a stable cache prefix.
 pub struct TurnIsolation {
     pub home: std::path::PathBuf,
     pub cwd: std::path::PathBuf,
-    // Held alive for the whole turn: dropping the TempDir deletes the
+    // Held alive for the whole session: dropping the TempDir deletes the
     // staged HOME out from under the running child.
     _stage: tempfile::TempDir,
 }
@@ -506,53 +453,6 @@ pub fn credential_file() -> Option<std::path::PathBuf> {
         .join("antigravity-cli")
         .join("antigravity-oauth-token");
     file.is_file().then_some(file)
-}
-
-fn read_lines(
-    stdout: std::process::ChildStdout,
-    timeout: std::time::Duration,
-) -> Result<Vec<Value>, String> {
-    use std::io::BufRead;
-    // Lines arrive over a channel so the deadline is real: `BufRead::lines`
-    // blocks between lines, and a silent child (sitting out a usage-limit
-    // window, stuck in its own backoff) would otherwise park the turn
-    // forever — a per-line elapsed check only fires when a line arrives.
-    // On timeout the caller kills the child; the reader thread then sees
-    // EOF and exits.
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let reader = std::io::BufReader::new(stdout);
-        for line in reader.lines() {
-            if tx.send(line).is_err() {
-                return;
-            }
-        }
-    });
-    let deadline = std::time::Instant::now() + timeout;
-    let mut out = Vec::new();
-    loop {
-        let line =
-            match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
-                Ok(Ok(line)) => line,
-                Ok(Err(e)) => return Err(format!("native stdout: {e}")),
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    return Err("Antigravity request timed out".into());
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-            };
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let v: Value = serde_json::from_str(line).map_err(|_| {
-            format!(
-                "invalid native stream-json output: {:?}",
-                line.chars().take(300).collect::<String>()
-            )
-        })?;
-        out.push(v);
-    }
-    Ok(out)
 }
 
 /// Fold native stream-json lines into a Responses SSE stream.
@@ -742,6 +642,10 @@ pub fn fold_lines(
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    // Unique per fold, not per-turn deterministic: pooled sessions answer
+    // several turns, and identical call ids across turns would make the
+    // echoed history ambiguous (and collide in the host transcript).
+    let call_tag = rand_hex(8);
     for (i, want) in wanted.iter().enumerate() {
         let tool = want.get("tool").and_then(Value::as_str).unwrap_or("");
         if !names.contains(&tool.to_string()) {
@@ -750,8 +654,8 @@ pub fn fold_lines(
             ));
         }
         let call_args = want.get("args").cloned().unwrap_or(json!({}));
-        // Deterministic call ids (fold order): the funnel has no native ids.
-        let id = format!("call_{}", i + 1);
+        // Deterministic within the fold; unique across the session.
+        let id = format!("call_{call_tag}_{}", i + 1);
         let args_str = serde_json::to_string(&call_args).unwrap_or_else(|_| "{}".into());
         calls.push((id, tool.to_string(), args_str));
     }
@@ -822,7 +726,7 @@ pub fn fold_lines(
     Ok((sse, natives, answer, calls, usage, stop))
 }
 
-fn conversation_of(line: &Value) -> String {
+pub(crate) fn conversation_of(line: &Value) -> String {
     line.get("conversation_id")
         .and_then(Value::as_str)
         .or_else(|| {

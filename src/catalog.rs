@@ -66,6 +66,28 @@ pub fn native_model(model: &str) -> String {
     canonical(model).to_string()
 }
 
+/// Effort-aware route: the host's `/thinking` pick (`reasoning.effort`)
+/// swaps the resolved id's effort tier — but only onto another PINNED id.
+/// agy couples effort into the model id (`gemini-3.8-flash-low`) and full
+/// ids run without `--effort`, so an unpinned swap would route somewhere
+/// unverified; those keep the pinned id instead (`xhigh`/`max` match no
+/// pinned tier today, and `pro` pins no `-medium`).
+pub fn native_model_for_effort(model: &str, effort: Option<&str>) -> String {
+    let canon = native_model(model);
+    let Some(effort) = effort else { return canon };
+    for tier in ["low", "medium", "high"] {
+        let suffix = format!("-{tier}");
+        if let Some(base) = canon.strip_suffix(&suffix) {
+            let candidate = format!("{base}-{effort}");
+            if context_windows().iter().any(|(id, _)| *id == candidate) {
+                return candidate;
+            }
+            return canon;
+        }
+    }
+    canon
+}
+
 /// Every routable id: full ids plus aliases.
 pub fn all_ids() -> Vec<String> {
     let mut out: Vec<String> = context_windows()

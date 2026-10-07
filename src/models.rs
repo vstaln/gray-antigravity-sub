@@ -20,6 +20,10 @@ pub fn catalog() -> ProviderModelCatalog {
             context_window: catalog::context_window(&id),
             reasoning_efforts: EFFORTS.iter().map(|s| s.to_string()).collect(),
             id,
+            // Full `agy` ids already encode effort: no effort-mapped
+            // variants, no composite slots.
+            variants: vec![],
+            slots: vec![],
         })
         .collect();
     ProviderModelCatalog { models }

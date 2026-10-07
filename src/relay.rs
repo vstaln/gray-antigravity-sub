@@ -4,8 +4,9 @@
 //! host a per-turn relay URL + bearer. The host POSTs its standard
 //! Responses body there; the relay admits exactly ONE request (anything
 //! past it gets 400 `ADMISSION_CONSUMED`), translates it to one funnel
-//! turn, spawns `agy` (which makes exactly one upstream request on its
-//! own), folds the native transcript to Responses SSE and streams it back.
+//! turn, drives a pooled `agy` child (which makes exactly one upstream
+//! request on its own — see [`crate::live`]), folds the native transcript
+//! to Responses SSE and streams it back.
 //!
 //! A turn can outlive the host's per-read timeout: past `HEADER_GRACE`
 //! the response becomes a close-delimited SSE stream kept alive with
@@ -92,7 +93,6 @@ fn handle_conn(
     let request_line = lines.next().unwrap_or("").to_string();
     let mut len = 0usize;
     let mut auth = String::new();
-    let mut session = String::new();
     for line in lines {
         let line = line.trim_end();
         if line.is_empty() {
@@ -105,8 +105,6 @@ fn handle_conn(
             len = v.trim().parse().unwrap_or(0);
         } else if name.eq_ignore_ascii_case("authorization") {
             auth = v.trim().to_string();
-        } else if name.eq_ignore_ascii_case("session-id") {
-            session = v.trim().to_string();
         }
     }
     let header_end = head
@@ -159,7 +157,7 @@ fn handle_conn(
         let intents = intents.clone();
         let bearer = bearer.to_string();
         std::thread::spawn(move || {
-            let _ = tx.send(run_turn(&intents, &bearer, &body, &session));
+            let _ = tx.send(run_turn(&intents, &bearer, &body));
         });
     }
     match rx.recv_timeout(HEADER_GRACE) {
@@ -217,7 +215,7 @@ fn handle_conn(
     }
 }
 
-fn run_turn(intents: &Intents, bearer: &str, raw: &[u8], session: &str) -> Result<Vec<u8>, String> {
+fn run_turn(intents: &Intents, bearer: &str, raw: &[u8]) -> Result<Vec<u8>, String> {
     let intent = intents
         .lock()
         .map(|mut m| m.remove(bearer))
@@ -226,30 +224,21 @@ fn run_turn(intents: &Intents, bearer: &str, raw: &[u8], session: &str) -> Resul
         .ok_or_else(|| "relay intent expired".to_string())?;
     let body: Value = serde_json::from_slice(raw)
         .map_err(|e| format!("relay body is not JSON ({} bytes): {e}", raw.len()))?;
-    let turn = crate::chat::prepare_turn(&body, &intent.model)?;
-    let tools: Vec<Value> = body
-        .get("tools")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    let names: Vec<String> = tools
-        .iter()
-        .filter_map(|t| t.get("name").and_then(Value::as_str).map(str::to_string))
-        .collect();
-    // Staged HOME + single funnel line: native makes exactly one upstream
-    // request on its own. The keepalive wraps the spawn: it retains the
-    // turn + staged HOME under the session's serialization gate and
-    // replays it when the session idles near the implicit-cache TTL.
-    let isolation = crate::chat::TurnIsolation::stage()?;
-    let lines = crate::keepalive::run_real_turn(
-        session,
-        turn,
-        isolation,
+    // The host's /thinking pick travels as reasoning.effort; it can only
+    // move a route between pinned effort tiers (see the catalog).
+    let effort = body
+        .get("reasoning")
+        .and_then(|r| r.get("effort"))
+        .and_then(Value::as_str);
+    // A pooled session when this history continues one (delta prompt),
+    // else a fresh staged-HOME spawn — either way native makes exactly
+    // one upstream request. Returns the folded SSE stream.
+    crate::live::run_turn(
+        &body,
+        &intent.model,
+        effort,
         std::time::Duration::from_secs(300),
-    )?;
-    let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
-    let (sse, _, _, _, _, _) = crate::chat::fold_lines(&lines, &names, &say)?;
-    Ok(sse)
+    )
 }
 
 /// Headers for a close-delimited SSE response (no Content-Length — the

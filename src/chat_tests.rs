@@ -186,41 +186,6 @@ fn fold_rejects_missing_finish() {
 }
 
 #[test]
-fn read_lines_times_out_on_a_silent_child() {
-    // A child that never prints and never exits must hit the deadline:
-    // before the channel-based read, the clock was only re-checked when
-    // a line arrived, so a silent runaway (a usage-limit backoff, a
-    // stuck retry loop) parked the turn forever.
-    let mut child = std::process::Command::new("sleep")
-        .arg("2")
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let e = read_lines(stdout, std::time::Duration::from_millis(50)).unwrap_err();
-    assert_eq!(e, "Antigravity request timed out");
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-#[test]
-fn read_lines_collects_until_eof() {
-    let mut child = std::process::Command::new("printf")
-        .arg("{\"event\":\"init\"}\n{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\"}}\n")
-        .stdout(std::process::Stdio::piped())
-        .spawn()
-        .unwrap();
-    let stdout = child.stdout.take().unwrap();
-    let lines = read_lines(stdout, std::time::Duration::from_secs(5)).unwrap();
-    assert_eq!(lines.len(), 2);
-    assert_eq!(
-        lines[1].pointer("/result/status").and_then(Value::as_str),
-        Some("SUCCESS")
-    );
-    let _ = child.wait();
-}
-
-#[test]
 fn fold_maps_quota_to_a_clean_error() {
     let lines = vec![json!({"event": "result", "result": {"conversation_id": "",
             "status": "ERROR", "response": "",
@@ -228,6 +193,102 @@ fn fold_maps_quota_to_a_clean_error() {
     let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
     let err = fold_lines(&lines, &[], &say).unwrap_err();
     assert!(err.contains("quota"), "unexpected: {err}");
+}
+
+#[test]
+fn continuation_extracts_the_delta() {
+    // absorbed [user "hi"] + echoed answer + new user item → tail only.
+    let absorbed = vec![json!({"role": "user", "content": "hi"})];
+    let input = vec![
+        json!({"role": "user", "content": "hi"}),
+        json!({"role": "assistant", "content": "answer"}),
+        json!({"role": "user", "content": "more"}),
+    ];
+    let delta = continuation(&absorbed, &[], "answer", &input).unwrap();
+    assert_eq!(delta, "[User]\nmore");
+}
+
+#[test]
+fn continuation_checks_call_id_echo() {
+    let absorbed = vec![json!({"role": "user", "content": "hi"})];
+    let reply_ids = vec!["call_ab12_1".to_string()];
+    let input = vec![
+        json!({"role": "user", "content": "hi"}),
+        json!({"type": "function_call", "call_id": "call_ab12_1",
+            "name": "bash", "arguments": "{}"}),
+        json!({"type": "function_call_output", "call_id": "call_ab12_1",
+            "output": "done"}),
+    ];
+    let delta = continuation(&absorbed, &reply_ids, "", &input).unwrap();
+    assert_eq!(delta, "[Tool result id=call_ab12_1]\ndone");
+    // A rewritten call id breaks the echo → prefix-miss class failure.
+    let mut wrong = input.clone();
+    wrong[1]["call_id"] = json!("call_zzz_1");
+    assert_eq!(continuation(&absorbed, &reply_ids, "", &wrong), Err("echo"));
+}
+
+#[test]
+fn continuation_undelivered_reply_gets_a_note() {
+    // The session answered with a call + text but gray's history carries
+    // no echo: continue with the note, not a respawn.
+    let absorbed = vec![json!({"role": "user", "content": "hi"})];
+    let input = vec![
+        json!({"role": "user", "content": "hi"}),
+        json!({"role": "user", "content": "again"}),
+    ];
+    let delta = continuation(&absorbed, &["call_ab12_1".to_string()], "answer", &input).unwrap();
+    assert!(delta.starts_with(UNDELIVERED_NOTE));
+    assert!(delta.ends_with("[User]\nagain"));
+}
+
+#[test]
+fn continuation_rejects_diverged_and_empty_tails() {
+    let absorbed = vec![json!({"role": "user", "content": "hi"})];
+    // Identical request (a host retry): nothing extends the prefix.
+    assert_eq!(continuation(&absorbed, &[], "", &absorbed), Err("prefix"));
+    // Different history entirely.
+    assert_eq!(
+        continuation(
+            &absorbed,
+            &[],
+            "",
+            &[json!({"role": "user", "content": "other"})]
+        ),
+        Err("prefix")
+    );
+    // Only an echo, nothing new to ask.
+    let echo_only = vec![
+        json!({"role": "user", "content": "hi"}),
+        json!({"role": "assistant", "content": "answer"}),
+    ];
+    assert_eq!(
+        continuation(&absorbed, &[], "answer", &echo_only),
+        Err("empty_delta")
+    );
+    // Two consecutive assistant items: the second can't belong to this
+    // session's reply, so the echo zone itself diverges.
+    let extra_echo = vec![
+        json!({"role": "user", "content": "hi"}),
+        json!({"role": "assistant", "content": "answer"}),
+        json!({"role": "assistant", "content": "spliced"}),
+        json!({"role": "user", "content": "tail"}),
+    ];
+    assert_eq!(
+        continuation(&absorbed, &[], "answer", &extra_echo),
+        Err("echo")
+    );
+    // An assistant item inside the new tail: mid-edited turn.
+    let mid_edit = vec![
+        json!({"role": "user", "content": "hi"}),
+        json!({"role": "assistant", "content": "answer"}),
+        json!({"role": "user", "content": "tail"}),
+        json!({"role": "assistant", "content": "spliced"}),
+        json!({"role": "user", "content": "again"}),
+    ];
+    assert_eq!(
+        continuation(&absorbed, &[], "answer", &mid_edit),
+        Err("empty_delta")
+    );
 }
 
 #[test]
