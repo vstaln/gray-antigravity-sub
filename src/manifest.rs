@@ -51,6 +51,11 @@ pub fn provider() -> ProviderDecl {
             },
             request: ProviderRequestPolicyDecl {
                 prompt_cache_key: false,
+                // Host-side verbatim warm replay must stay off (the
+                // relay admits exactly ONE POST per turn); the pinned
+                // protocol has no `warm_replay` field and its default is
+                // off — declare `warm_replay: false` when the pin moves
+                // to a protocol that has it.
                 store: false,
                 include_reasoning_encrypted: true,
                 previous_response_id: false,

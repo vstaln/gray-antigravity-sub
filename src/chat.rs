@@ -370,7 +370,16 @@ pub fn spawn_turn(
         .stdout
         .take()
         .ok_or_else(|| "native stdout unavailable".to_string())?;
-    let lines = read_lines(stdout, timeout)?;
+    let lines = match read_lines(stdout, timeout) {
+        Ok(l) => l,
+        Err(e) => {
+            // Never leave a timed-out native run holding the staged HOME
+            // or still burning a quota window against it.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(e);
+        }
+    };
     if std::env::var_os("ANTIGRAVITY_SUB_DEBUG").is_some() {
         let write_600 = |path: &str, data: String| {
             let mut opts = std::fs::OpenOptions::new();
@@ -504,14 +513,33 @@ fn read_lines(
     timeout: std::time::Duration,
 ) -> Result<Vec<Value>, String> {
     use std::io::BufRead;
-    let reader = std::io::BufReader::new(stdout);
-    let mut out = Vec::new();
-    let start = std::time::Instant::now();
-    for line in reader.lines() {
-        if start.elapsed() > timeout {
-            return Err("Antigravity request timed out".into());
+    // Lines arrive over a channel so the deadline is real: `BufRead::lines`
+    // blocks between lines, and a silent child (sitting out a usage-limit
+    // window, stuck in its own backoff) would otherwise park the turn
+    // forever — a per-line elapsed check only fires when a line arrives.
+    // On timeout the caller kills the child; the reader thread then sees
+    // EOF and exits.
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let reader = std::io::BufReader::new(stdout);
+        for line in reader.lines() {
+            if tx.send(line).is_err() {
+                return;
+            }
         }
-        let line = line.map_err(|e| format!("native stdout: {e}"))?;
+    });
+    let deadline = std::time::Instant::now() + timeout;
+    let mut out = Vec::new();
+    loop {
+        let line =
+            match rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                Ok(Ok(line)) => line,
+                Ok(Err(e)) => return Err(format!("native stdout: {e}")),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    return Err("Antigravity request timed out".into());
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            };
         let line = line.trim();
         if line.is_empty() {
             continue;

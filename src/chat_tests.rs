@@ -186,6 +186,41 @@ fn fold_rejects_missing_finish() {
 }
 
 #[test]
+fn read_lines_times_out_on_a_silent_child() {
+    // A child that never prints and never exits must hit the deadline:
+    // before the channel-based read, the clock was only re-checked when
+    // a line arrived, so a silent runaway (a usage-limit backoff, a
+    // stuck retry loop) parked the turn forever.
+    let mut child = std::process::Command::new("sleep")
+        .arg("2")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let e = read_lines(stdout, std::time::Duration::from_millis(50)).unwrap_err();
+    assert_eq!(e, "Antigravity request timed out");
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn read_lines_collects_until_eof() {
+    let mut child = std::process::Command::new("printf")
+        .arg("{\"event\":\"init\"}\n{\"event\":\"result\",\"result\":{\"status\":\"SUCCESS\"}}\n")
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let stdout = child.stdout.take().unwrap();
+    let lines = read_lines(stdout, std::time::Duration::from_secs(5)).unwrap();
+    assert_eq!(lines.len(), 2);
+    assert_eq!(
+        lines[1].pointer("/result/status").and_then(Value::as_str),
+        Some("SUCCESS")
+    );
+    let _ = child.wait();
+}
+
+#[test]
 fn fold_maps_quota_to_a_clean_error() {
     let lines = vec![json!({"event": "result", "result": {"conversation_id": "",
             "status": "ERROR", "response": "",

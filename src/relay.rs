@@ -7,6 +7,11 @@
 //! turn, spawns `agy` (which makes exactly one upstream request on its
 //! own), folds the native transcript to Responses SSE and streams it back.
 //!
+//! A turn can outlive the host's per-read timeout: past `HEADER_GRACE`
+//! the response becomes a close-delimited SSE stream kept alive with
+//! `: keepalive` comments every `KEEPALIVE`. A client that goes away is
+//! just a failed write — the turn finishes unread.
+//!
 //! Credentials are forwarded, never persisted: the bearer is a per-turn
 //! token minted by the sidecar, never the user's OAuth token.
 
@@ -14,9 +19,17 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
+
+/// How long the relay may hold the response headers before committing to
+/// the close-delimited keepalive path (the host's per-read timeout).
+const HEADER_GRACE: Duration = Duration::from_secs(20);
+/// SSE comment cadence once the response is streaming.
+const KEEPALIVE: Duration = Duration::from_secs(15);
 
 /// What `provider/chat` parked for one turn: the relay fills the body in.
 pub struct RelayIntent {
@@ -138,9 +151,19 @@ fn handle_conn(
         write_resp(s, 400, body.to_string().as_bytes());
         return;
     }
-    // Admitted: the one request. Translate, spawn, fold, stream.
-    match run_turn(intents, bearer, &body, &session) {
-        Ok(sse) => {
+    // Admitted: the one request. The turn runs on a worker thread so the
+    // connection can answer within HEADER_GRACE — or commit to a
+    // close-delimited stream and keep it alive until the turn ends.
+    let (tx, rx) = mpsc::channel::<Result<Vec<u8>, String>>();
+    {
+        let intents = intents.clone();
+        let bearer = bearer.to_string();
+        std::thread::spawn(move || {
+            let _ = tx.send(run_turn(&intents, &bearer, &body, &session));
+        });
+    }
+    match rx.recv_timeout(HEADER_GRACE) {
+        Ok(Ok(sse)) => {
             let header = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 sse.len()
@@ -149,11 +172,47 @@ fn handle_conn(
             let _ = s.write_all(&sse);
             let _ = s.flush();
         }
-        Err(detail) => {
-            let body = json!({"type": "error", "error": {
-                "type": "server_error", "message": detail,
-            }});
-            write_resp(s, 500, body.to_string().as_bytes());
+        Ok(Err(detail)) => {
+            if !write_sse_head(s) {
+                return;
+            }
+            write_sse_failure(s, &detail);
+        }
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            if write_sse_head(s) {
+                write_sse_failure(s, "turn worker died");
+            }
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            // Slow turn: no Content-Length, the stream ends at close.
+            // eventsource-stream ignores `:` comment lines.
+            if !write_sse_head(s) {
+                return;
+            }
+            loop {
+                match rx.recv_timeout(KEEPALIVE) {
+                    Ok(Ok(sse)) => {
+                        let _ = s.write_all(&sse);
+                        let _ = s.flush();
+                        return;
+                    }
+                    Ok(Err(detail)) => {
+                        write_sse_failure(s, &detail);
+                        return;
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        // Client gone is just a failed write — the turn
+                        // finishes unread.
+                        if s.write_all(b": keepalive\n\n")
+                            .and_then(|_| s.flush())
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return,
+                }
+            }
         }
     }
 }
@@ -193,6 +252,31 @@ fn run_turn(intents: &Intents, bearer: &str, raw: &[u8], session: &str) -> Resul
     Ok(sse)
 }
 
+/// Headers for a close-delimited SSE response (no Content-Length — the
+/// stream ends at connection close).
+fn write_sse_head(s: &mut std::net::TcpStream) -> bool {
+    s.write_all(
+        b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n",
+    )
+    .and_then(|_| s.flush())
+    .is_ok()
+}
+
+/// Turn failure as an SSE `response.failed` frame. A retryable HTTP
+/// status would only be re-POSTed into the consumed admission —
+/// surfacing ADMISSION_CONSUMED instead of the real failure — so turn
+/// errors (quota walls, timeouts, spawn failures) ride the stream; the
+/// host's turn-level retry re-enters through `provider/chat` → a fresh
+/// relay. Caller writes the head first if the stream isn't open yet.
+fn write_sse_failure(s: &mut std::net::TcpStream, detail: &str) {
+    let failed = json!({"type": "response.failed",
+        "response": {"status": "failed",
+            "error": {"code": "server_error", "message": detail}}});
+    let _ = s
+        .write_all(format!("data: {failed}\n\ndata: [DONE]\n\n").as_bytes())
+        .and_then(|_| s.flush());
+}
+
 fn write_resp(s: &mut std::net::TcpStream, status: u16, body: &[u8]) {
     let reason = match status {
         400 => "Bad Request",
@@ -208,3 +292,7 @@ fn write_resp(s: &mut std::net::TcpStream, status: u16, body: &[u8]) {
     let _ = s.write_all(body);
     let _ = s.flush();
 }
+
+#[path = "relay_tests.rs"]
+#[cfg(test)]
+mod tests;
