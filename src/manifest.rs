@@ -6,7 +6,7 @@ use gray_plugin::{
 };
 
 pub const PLUGIN_NAME: &str = "antigravity-sub";
-pub const PLUGIN_VERSION: &str = "0.1.2";
+pub const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROVIDER_ID: &str = "antigravity-subscription";
 pub const AUTH_METHOD_ID: &str = "antigravity-login";
 
@@ -60,7 +60,10 @@ pub fn provider() -> ProviderDecl {
                 tool_choice: Some("auto".to_string()),
                 parallel_tool_calls: Some(true),
                 text_verbosity: Some("low".to_string()),
-                cache_ttl_secs: None,
+                // Gemini's implicit cache outlives a turn by ~minutes;
+                // live.rs keeps pooled sessions under a ~4min refresh,
+                // so ~5min is the honest declared lifetime.
+                cache_ttl_secs: Some(300),
             },
             headers: vec![ProviderHeaderDecl {
                 name: "session-id".to_string(),

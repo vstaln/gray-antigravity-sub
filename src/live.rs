@@ -50,8 +50,8 @@
 //! (`absorbed` + the reply echo) which the ping never touches. A failed
 //! ping latches `keepalive_disabled` (fail closed: an erroring session
 //! must not refresh on a loop); the next real turn re-arms it. Warming
-//! stops once user idleness passes `KEEPALIVE_IDLE_MAX` — the reaper
-//! takes the session soon anyway.
+//! stops once user idleness passes `KEEPALIVE_IDLE_MAX` — set to
+//! `IDLE_TTL`, so a session stays warm for its whole reusable life.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
@@ -79,9 +79,12 @@ const KEEPALIVE_SWEEP: Duration = Duration::from_secs(30);
 /// this old — comfortably under the implicit prompt-cache TTL, so the
 /// next continuation still hits a warm prefix.
 const KEEPALIVE_AFTER: Duration = Duration::from_secs(4 * 60);
-/// Stop warming once the user has been idle this long: `IDLE_TTL` reaps
-/// the session soon anyway, so further refresh buys nothing.
-const KEEPALIVE_IDLE_MAX: Duration = Duration::from_secs(20 * 60);
+/// Keep warming for as long as a pooled session can still answer a turn:
+/// stopping earlier leaves a live session whose ~minutes cache has
+/// already lapsed, so a turn landing in the gap re-bills the whole
+/// transcript on a session that looks warm. `IDLE_TTL` reaps it either
+/// way.
+const KEEPALIVE_IDLE_MAX: Duration = IDLE_TTL;
 /// A turn waits this long for a matching session to come back from a
 /// keepalive before spawning fresh instead.
 const KEEPALIVE_WAIT: Duration = Duration::from_secs(60);

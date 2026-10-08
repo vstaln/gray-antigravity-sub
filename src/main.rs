@@ -6,7 +6,8 @@
 //!
 //! Wire (NDJSON over stdio, host ids are opaque):
 //! - `plugin/manifest` → manifest + the `antigravity-subscription` provider decl.
-//! - `provider/models` → pinned catalog (no HTTP endpoint exists).
+//! - `provider/models` → live catalog (`agy models` discovery, pinned
+//!   table as fallback — see `discover`/`catalog`).
 //! - `provider/chat` → one relayed turn (declares the per-turn relay URL +
 //!   bearer the host's standard Responses POST must use).
 //! - `provider/auth/*` → the user's own `agy` Google sign-in owns
@@ -52,6 +53,13 @@ async fn main() -> anyhow::Result<()> {
         println!("{}", serde_json::to_string(&manifest::manifest())?);
         return Ok(());
     }
+    // Warm the model-discovery cache in the background (`agy models` is a
+    // ~seconds network fetch): the first `provider/models` then answers
+    // live instead of blocking on the spawn. Failure just leaves the
+    // pinned fallback in charge.
+    std::thread::spawn(|| {
+        let _ = antigravity_sub::discover::live();
+    });
     let relays: Relays = Arc::new(Mutex::new(HashMap::new()));
     let mut lines =
         tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(tokio::io::stdin()));

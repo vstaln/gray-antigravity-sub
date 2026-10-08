@@ -761,12 +761,28 @@ pub fn map_usage(u: &Value) -> Usage {
         .get("thinking_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0) as usize;
-    let read = u
-        .get("cache_read_tokens")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
+    // Cache-read field spellings differ across upstreams. Flat counters
+    // (`cache_read_tokens` & friends) sit next to an exclusive
+    // `input_tokens`, so the inclusive total is input + read. Gemini
+    // usageMetadata passthrough reports `cached_content_token_count`
+    // next to an already-inclusive `input_tokens` — add nothing there.
+    let (read, inclusive) = [
+        ("cache_read_tokens", false),
+        ("cached_tokens", false),
+        ("cache_read_input_tokens", false),
+        ("cached_content_token_count", true),
+        ("cachedContentTokenCount", true),
+    ]
+    .iter()
+    .find_map(|(k, incl)| u.get(*k).and_then(Value::as_u64).map(|v| (v, *incl)))
+    .unwrap_or((0, false));
+    let read = read as usize;
     Usage {
-        input_tokens: input.saturating_add(read),
+        input_tokens: if inclusive {
+            input.max(read)
+        } else {
+            input.saturating_add(read)
+        },
         output_tokens: output.saturating_add(thinking),
         cached_tokens: read,
     }
