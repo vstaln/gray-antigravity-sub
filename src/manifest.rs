@@ -9,6 +9,8 @@ pub const PLUGIN_NAME: &str = "antigravity-sub";
 pub const PLUGIN_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const PROVIDER_ID: &str = "antigravity-subscription";
 pub const AUTH_METHOD_ID: &str = "antigravity-login";
+/// The operator command: `/antigravity tools …` owns the tool allowlist.
+pub const ANTIGRAVITY_COMMAND: &str = "/antigravity";
 
 /// A protocol-1.2 manifest value. Credentials stay with the user's own
 /// `agy` sign-in (OS keyring + browser): the `external-login` method
@@ -19,7 +21,7 @@ pub fn manifest() -> gray_plugin::Manifest {
         name: PLUGIN_NAME.to_string(),
         version: PLUGIN_VERSION.to_string(),
         tools: Vec::new(),
-        commands: vec!["/antigravity".to_string()],
+        commands: vec![ANTIGRAVITY_COMMAND.to_string()],
         hooks: Vec::new(),
         protocol: Some("1.2".to_string()),
         subcommands: Vec::new(),
@@ -30,6 +32,24 @@ pub fn manifest() -> gray_plugin::Manifest {
         providers: vec![provider()],
         provider_errors: Vec::new(),
     }
+}
+
+/// `command/run` result for a claimed command, `None` for names this
+/// sidecar doesn't answer. A bare `/antigravity` answers nothing (`{}`)
+/// so the host falls back to the provider-login shortcut — connect →
+/// model picker on Antigravity's rows — while `/antigravity tools …`
+/// owns the tool allowlist (see [`crate::settings`]), answered as
+/// `{"text": …}`.
+pub fn run_command(name: &str, argv: &[String]) -> Option<serde_json::Value> {
+    if name == ANTIGRAVITY_COMMAND {
+        if argv.is_empty() {
+            return Some(serde_json::json!({}));
+        }
+        return Some(serde_json::json!({
+            "text": crate::settings::command(argv),
+        }));
+    }
+    None
 }
 
 /// Antigravity subscription provider. Requests go to the loopback relay the

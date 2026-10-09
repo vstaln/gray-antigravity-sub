@@ -200,6 +200,9 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
         .unwrap_or_default();
     let mut names: Vec<String> = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
+    // The operator's allowlist (`/antigravity tools`, default bash-only):
+    // only passing tools reach `names` and the finish funnel's manifest.
+    let policy = crate::settings::ToolPolicy::load();
     if let Some(tools) = body.get("tools").and_then(Value::as_array) {
         for t in tools {
             let name = t.get("name").and_then(Value::as_str).unwrap_or("");
@@ -208,6 +211,11 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
                 .and_then(Value::as_str)
                 .is_some_and(|k| k != "function")
             {
+                continue;
+            }
+            // Filter before validating: a disallowed tool is invisible
+            // here, so its name (valid or not) can never fail a turn.
+            if !policy.allows(name) {
                 continue;
             }
             check_tool_name(name, &seen_names)?;
@@ -259,6 +267,9 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
                 continue;
             }
             let name = t.get("name").and_then(Value::as_str).unwrap_or("");
+            if !policy.allows(name) {
+                continue;
+            }
             let desc = t.get("description").and_then(Value::as_str).unwrap_or("");
             let params = normalize_input_schema(t.get("parameters").unwrap_or(&json!({})));
             tool_specs.push(format!("- {name}: {desc} Args: {params}"));

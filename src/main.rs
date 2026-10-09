@@ -13,6 +13,10 @@
 //! - `provider/auth/*` → the user's own `agy` Google sign-in owns
 //!   credentials; start/poll report external-login status, refresh/revoke
 //!   are unsupported.
+//! - `command/run` → a bare `/antigravity` answers nothing so the host's
+//!   provider-login shortcut switches the session to Antigravity, and
+//!   `/antigravity tools …` owns the upstream tool allowlist
+//!   (`{"text": …}`).
 //! - `plugin/shutdown` → clean exit. Unknown methods are protocol errors
 //!   (provider sidecars must fail loudly, never hang a turn).
 
@@ -51,6 +55,13 @@ async fn main() -> anyhow::Result<()> {
     // `gray install plugin` registers sidecars by running `<bin> manifest`.
     if std::env::args().nth(1).as_deref() == Some("manifest") {
         println!("{}", serde_json::to_string(&manifest::manifest())?);
+        return Ok(());
+    }
+    // `gray antigravity-sub tools …` and the REPL's `/antigravity tools …`
+    // land on the same file: one allowlist, no sidecar needed.
+    if std::env::args().nth(1).as_deref() == Some("tools") {
+        let args: Vec<String> = std::env::args().skip(2).collect();
+        println!("{}", antigravity_sub::settings::tools_command(&args));
         return Ok(());
     }
     // Warm the model-discovery cache in the background (`agy models` is a
@@ -175,6 +186,23 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
             Ok(serde_json::to_value(models::catalog()).unwrap())
         }
         "provider/chat" => chat_turn(relays, params).await,
+        "command/run" => {
+            let name = params
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let argv: Vec<String> = params
+                .get("argv")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            manifest::run_command(name, &argv)
+                .ok_or_else(|| ProviderRpcError::Protocol("unknown command".into()))
+        }
         "plugin/shutdown" => Ok(json!({})),
         _ => Err(ProviderRpcError::Protocol("unknown provider method".into())),
     }

@@ -8,6 +8,7 @@ pub mod live;
 pub mod manifest;
 pub mod models;
 pub mod relay;
+pub mod settings;
 pub mod setup;
 
 #[cfg(test)]
