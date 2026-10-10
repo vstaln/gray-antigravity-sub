@@ -20,7 +20,7 @@
 //! - `plugin/shutdown` → clean exit. Unknown methods are protocol errors
 //!   (provider sidecars must fail loudly, never hang a turn).
 
-use antigravity_sub::{catalog, live, manifest, models, relay, setup};
+use antigravity_sub::{usage,catalog, live, manifest, models, relay, setup};
 
 use gray_plugin::{ProviderRefreshRequest, ProviderRevokeRequest, ProviderRpcError};
 use serde::{Deserialize, Serialize};
@@ -31,6 +31,7 @@ use std::sync::{Arc, Mutex};
 
 #[derive(Deserialize)]
 struct Request {
+    #[serde(default)]
     id: Value,
     method: String,
     #[serde(default)]
@@ -87,6 +88,13 @@ async fn main() -> anyhow::Result<()> {
             Ok(request) => request,
             Err(_) => continue,
         };
+        if request.id.is_null() {
+            if request.method == "plugin/shutdown" {
+                live::shutdown_all();
+                return Ok(());
+            }
+            continue;
+        }
         let outcome = handle(&relays, &request).await;
         let response = match outcome {
             Ok(result) => Response {
@@ -170,6 +178,7 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
             ensure_provider(&req.provider, &req.auth_method)?;
             Ok(json!({"status": "unsupported"}))
         }
+        "provider/usage" => usage::handle(),
         "provider/models" => {
             // External login owns no credential material: only the
             // provider/auth-method pair is checked, the envelope (if any)

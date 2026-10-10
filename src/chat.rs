@@ -531,6 +531,7 @@ pub fn fold_lines(
             || detail.contains("RESOURCE_EXHAUSTED")
             || detail.contains("code 429")
         {
+            crate::usage::note_quota_event(&detail);
             return Err(format!("Antigravity quota exhausted (native: {detail})"));
         }
         if !detail.is_empty() {
