@@ -146,7 +146,16 @@ pub enum LoginState {
 /// `BROWSER=/bin/true` exits without touching Firefox.
 ///
 /// `AGY_SUB_PROBE_TIMEOUT_SECS` overrides the default 30s (tests use 1s…5s).
+///
+/// The probe is a billed `agy -p hi` prompt, so a confirmed `LoggedIn` is
+/// remembered for the sidecar's lifetime; `LoggedOut`/`Unknown` are never
+/// cached so a fresh login is picked up on the next probe.
 pub fn probe_login() -> LoginState {
+    static LOGGED_IN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if LOGGED_IN.load(std::sync::atomic::Ordering::Relaxed) {
+        return LoginState::LoggedIn;
+    }
     // No token file: logged out without spawning (and without any browser).
     // The probe never reads token bytes; it only checks the file exists,
     // then lets the user's own CLI answer through the staged symlink.
@@ -221,11 +230,15 @@ pub fn probe_login() -> LoginState {
         let _ = child.wait();
         return LoginState::Unknown;
     }
-    match status {
+    let state = match status {
         Some(Ok(s)) if s.success() => LoginState::LoggedIn,
         Some(Ok(_)) => LoginState::LoggedOut,
         _ => LoginState::Unknown,
+    };
+    if matches!(state, LoginState::LoggedIn) {
+        LOGGED_IN.store(true, std::sync::atomic::Ordering::Relaxed);
     }
+    state
 }
 
 fn wait_timeout(
