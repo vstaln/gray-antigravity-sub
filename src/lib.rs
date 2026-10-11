@@ -4,6 +4,7 @@
 pub mod catalog;
 pub mod chat;
 pub mod discover;
+pub mod guard;
 pub mod live;
 pub mod manifest;
 pub mod models;

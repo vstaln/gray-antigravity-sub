@@ -281,7 +281,10 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
         You have NO other tools - never call any native tool for any reason. Gray owns all tools, approvals, and the filesystem. \
         To use a gray tool, list it in the calls array with its name and args object, and put your reply text in answer. \
         Later messages in this conversation come from gray too: tool results arrive as `[Tool result id=…]` records \
-        and new user input as `[User]` records — always answer the latest."
+        and new user input as `[User]` records — always answer the latest. \
+        You write exactly ONE assistant turn. Never write `[User]`, `[Tool result …]` or any other \
+        transcript record yourself; tool results only come from the harness. Never claim a command \
+        ran unless its `[Tool result]` is in the transcript."
             .to_string(),
     );
     if !tool_specs.is_empty() {
@@ -644,7 +647,20 @@ pub fn fold_lines(
         })
         .unwrap_or("")
         .to_string();
-    if answer.trim().is_empty() {
+    let (answer, cut) = crate::guard::cut_transcript(&answer);
+    if let Some(m) = cut {
+        eprintln!(
+            "antigravity-sub: answer cut at fabricated {} record (offset {})",
+            crate::guard::marker_name(m),
+            answer.len()
+        );
+    }
+    let answer = crate::guard::strip_reasoning(&answer).trim().to_string();
+    let has_calls = args
+        .get("calls")
+        .and_then(Value::as_array)
+        .is_some_and(|c| !c.is_empty());
+    if answer.is_empty() && (cut.is_none() || !has_calls) {
         return Err("incomplete native response: finish carried no answer".into());
     }
     say(format!("…{answer}"));
