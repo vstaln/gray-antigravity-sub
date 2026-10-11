@@ -393,15 +393,33 @@ fn keepalive_due(
 fn take_keepalive() -> Option<Arc<Mutex<LiveSession>>> {
     let pool = POOL.get()?;
     let mut pool = pool.lock().unwrap_or_else(|e| e.into_inner());
-    let i = pool.live.iter().position(|arc| {
-        arc.try_lock().is_ok_and(|mut s| {
-            keepalive_due(
-                s.last_contact,
-                s.last_used,
-                s.keepalive_disabled,
-                s.dead,
-                matches!(s.child.try_wait(), Ok(None)),
-            )
+    let snaps: Vec<_> = pool
+        .live
+        .iter()
+        .map(|arc| {
+            arc.try_lock().ok().map(|mut s| {
+                (
+                    keepalive_due(
+                        s.last_contact,
+                        s.last_used,
+                        s.keepalive_disabled,
+                        s.dead,
+                        matches!(s.child.try_wait(), Ok(None)),
+                    ),
+                    s.dead,
+                    s.last_used,
+                    s.native_model.clone(),
+                    s.system.clone(),
+                )
+            })
+        })
+        .collect();
+    let i = snaps.iter().position(|snap| {
+        snap.as_ref().is_some_and(|(due, _, last_used, model, system)| {
+            *due
+                && !snaps.iter().flatten().any(|(_, dead2, lu, m, sys)| {
+                    !dead2 && m == model && sys == system && lu > last_used
+                })
         })
     })?;
     let arc = pool.live.remove(i);
