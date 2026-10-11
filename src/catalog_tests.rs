@@ -86,6 +86,36 @@ fn pinned_fallback_unknown_ids_pass_through() {
 // --- live discovery answers: the listing, aliases, effort follow it ---
 
 #[test]
+fn bare_family_base_resolves_to_first_routable_tier() {
+    let snap = Snapshot::pinned_only();
+    // The picker row id (`gemini-3.8-flash`) routes nowhere itself —
+    // only its suffixed members do; it degrades like an alias.
+    assert_eq!(
+        canonical_in(&snap, "gemini-3.8-flash"),
+        "gemini-3.8-flash-low"
+    );
+    assert_eq!(
+        native_model_for_effort_in(&snap, "gemini-3.8-flash", Some("high")),
+        "gemini-3.8-flash-high"
+    );
+    // A routable tierless id still passes through untouched.
+    let live = live_1_3_1();
+    assert_eq!(
+        canonical_in(&live, "claude-sonnet-4-6"),
+        "claude-sonnet-4-6"
+    );
+    assert_eq!(
+        canonical_in(&live, "gemini-3.8-flash"),
+        "gemini-3.8-flash-low"
+    );
+    // Unknown ids keep passing through.
+    assert_eq!(
+        canonical_in(&snap, "some-future-model"),
+        "some-future-model"
+    );
+}
+
+#[test]
 fn live_list_replaces_the_pinned_table() {
     let snap = live_1_3_1();
     let ids = all_ids_in(&snap);

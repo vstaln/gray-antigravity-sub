@@ -20,7 +20,7 @@
 //! - `plugin/shutdown` → clean exit. Unknown methods are protocol errors
 //!   (provider sidecars must fail loudly, never hang a turn).
 
-use antigravity_sub::{usage,catalog, live, manifest, models, relay, setup};
+use antigravity_sub::{catalog, live, manifest, models, relay, setup, usage};
 
 use gray_plugin::{ProviderRefreshRequest, ProviderRevokeRequest, ProviderRpcError};
 use serde::{Deserialize, Serialize};
@@ -63,6 +63,10 @@ async fn main() -> anyhow::Result<()> {
     if std::env::args().nth(1).as_deref() == Some("tools") {
         let args: Vec<String> = std::env::args().skip(2).collect();
         println!("{}", antigravity_sub::settings::tools_command(&args));
+        return Ok(());
+    }
+    if std::env::args().nth(1).as_deref() == Some("status") {
+        println!("{}", antigravity_sub::status::text());
         return Ok(());
     }
     // Warm the model-discovery cache in the background (`agy models` is a

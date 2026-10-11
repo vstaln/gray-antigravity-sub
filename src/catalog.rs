@@ -12,8 +12,9 @@
 //! `agy` couples model and effort in the id itself
 //! (`gemini-3.8-flash-low`): full ids run WITHOUT `--effort`, base ids
 //! REQUIRE it (and reject a mismatched one). The spawn path therefore
-//! never passes `--effort` — effort levels are separate models, not a
-//! knob — and effort mapping only swaps between ids the current
+//! never passes `--effort` — the catalog collapses each family into one
+//! row whose variants pin every tier, so effort is a levels knob, not
+//! sibling models — and effort mapping only swaps between ids the current
 //! routable set (live, else pinned) says exist.
 
 use crate::discover::{self, DiscoveredModel};
@@ -64,6 +65,11 @@ fn aliases() -> &'static [(&'static str, &'static str, &'static str)] {
     ]
 }
 
+/// The effort tiers `agy` bakes into ids, in the catalog's preference
+/// order: `resolve_alias` degrades a family through the same sequence,
+/// and a bare base resolves to its first routable member.
+pub(crate) const TIERS: &[&str] = &["low", "medium", "high"];
+
 /// One decision point's view of routable ids: the live list when
 /// `agy models` answered, else `None` and the pinned table governs.
 /// Taking it once per decision keeps a catalog or a turn consistent even
@@ -80,12 +86,12 @@ impl Snapshot {
     }
 
     #[cfg(test)]
-    fn pinned_only() -> Self {
+    pub(crate) fn pinned_only() -> Self {
         Self { live: None }
     }
 
     #[cfg(test)]
-    fn with_live(live: &[(&str, &str)]) -> Self {
+    pub(crate) fn with_live(live: &[(&str, &str)]) -> Self {
         Self {
             live: Some(
                 live.iter()
@@ -110,7 +116,7 @@ impl Snapshot {
     /// `id` is a real route: on the live list, or pinned when discovery
     /// is down. A pinned id absent from an answered live list no longer
     /// counts — the CLI's own listing outranks our memory of it.
-    fn is_routable(&self, id: &str) -> bool {
+    pub(crate) fn is_routable(&self, id: &str) -> bool {
         match &self.live {
             Some(models) => models.iter().any(|m| m.id == id),
             None => pinned().iter().any(|(pin, _)| *pin == id),
@@ -118,7 +124,7 @@ impl Snapshot {
     }
 
     /// The display name `agy` itself reports for a live id.
-    fn live_name(&self, id: &str) -> Option<&str> {
+    pub(crate) fn live_name(&self, id: &str) -> Option<&str> {
         self.live
             .as_ref()?
             .iter()
@@ -142,7 +148,7 @@ impl Snapshot {
                 .map(|m| m.id.as_str())
                 .filter(|id| id.contains(family))
                 .collect();
-            for tier in ["low", "medium", "high"] {
+            for tier in TIERS {
                 let suffix = format!("-{tier}");
                 if let Some(id) = family.iter().find(|id| id.ends_with(&suffix)) {
                     return Some((*id).to_string());
@@ -157,8 +163,21 @@ impl Snapshot {
 }
 
 fn canonical_in(snap: &Snapshot, model: &str) -> String {
-    snap.resolve_alias(model)
-        .unwrap_or_else(|| model.to_string())
+    if let Some(id) = snap.resolve_alias(model) {
+        return id;
+    }
+    // A bare family base (`gemini-3.8-flash`, the picker row id) routes
+    // nowhere itself — only its suffixed members do. Degrade onto the
+    // first routable tier, the order `resolve_alias` prefers.
+    if !snap.is_routable(model) {
+        for tier in TIERS {
+            let candidate = format!("{model}-{tier}");
+            if snap.is_routable(&candidate) {
+                return candidate;
+            }
+        }
+    }
+    model.to_string()
 }
 
 /// Context window for a route: pinned table, `None` when unknown.
@@ -200,7 +219,7 @@ pub(crate) fn native_model_for_effort_in(
 ) -> String {
     let canon = canonical_in(snap, model);
     let Some(effort) = effort else { return canon };
-    for tier in ["low", "medium", "high"] {
+    for tier in TIERS {
         let suffix = format!("-{tier}");
         if let Some(base) = canon.strip_suffix(&suffix) {
             let candidate = format!("{base}-{effort}");
@@ -251,7 +270,7 @@ pub(crate) fn display_name_in(snap: &Snapshot, id: &str) -> String {
 /// Title-case each word without pulling in a dependency.
 /// `5-5` in a claude id is `5.5` upstream: a lone digit folds onto a
 /// digit-ending word. (`3.8` gemini ids already carry real dots.)
-fn title_case(id: &str) -> String {
+pub(crate) fn title_case(id: &str) -> String {
     let short = id.replace('-', " ");
     let mut words: Vec<String> = Vec::new();
     for w in short.split_whitespace() {

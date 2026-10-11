@@ -75,14 +75,114 @@ fn event_path() -> Option<PathBuf> {
     Some(home.join(".cache/antigravity-sub/quota-event.json"))
 }
 
-/// `agy`'s stored OAuth credential: `{token: {access_token,
-/// refresh_token, expiry}, auth_method, id_token}`.
+/// The `agy` OAuth token: the OS keyring entry `agy` actually signs in
+/// with (go-keyring: service `gemini`, user `antigravity`), then the
+/// legacy token file. `agy` stopped refreshing that file once it moved to
+/// the keyring, so on such installs it only holds an expired bearer.
 fn read_token() -> Option<(String, Option<String>)> {
-    let path = cli_dir()?.join("antigravity-oauth-token");
-    let v: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
+    keyring_token()
+        .and_then(|raw| parse_token(&raw))
+        .or_else(|| {
+            let path = cli_dir()?.join("antigravity-oauth-token");
+            parse_token(&std::fs::read_to_string(path).ok()?)
+        })
+}
+
+/// A locked keyring may prompt; `/usage` must not wait on it.
+const KEYRING_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn keyring_token() -> Option<String> {
+    use std::io::Read;
+    let mut child = std::process::Command::new("secret-tool")
+        .args(["lookup", "service", "gemini", "username", "antigravity"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + KEYRING_TIMEOUT;
+    while child.try_wait().ok()?.is_none() {
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    let mut out = String::new();
+    child.stdout.take()?.read_to_string(&mut out).ok()?;
+    Some(out.trim().to_string()).filter(|s| !s.is_empty())
+}
+
+fn parse_token(raw: &str) -> Option<(String, Option<String>)> {
+    let v: Value = serde_json::from_str(raw).ok()?;
     let access = v["token"]["access_token"].as_str()?.to_string();
     let refresh = v["token"]["refresh_token"].as_str().map(str::to_string);
     Some((access, refresh))
+}
+
+/// `retrieveUserQuotaSummary` -> usage windows. The live shape nests
+/// buckets under model groups (`groups[].buckets[]`: "Gemini Models" with
+/// `gemini-weekly` / `gemini-5h`, a third-party group, ...), each bucket
+/// carrying `window`, `remainingFraction` and `resetTime`. A flat
+/// `buckets[]` is accepted too.
+fn quota_windows(q: &Value) -> Vec<Value> {
+    let empty = Vec::new();
+    let mut out = Vec::new();
+    let mut push = |group: Option<&str>, b: &Value| {
+        let id = b
+            .get("bucketId")
+            .or_else(|| b.get("modelId"))
+            .or_else(|| b.get("model"))
+            .and_then(Value::as_str)
+            .unwrap_or("quota");
+        let (kind, mins, span): (&str, Option<u64>, String) =
+            match b.get("window").and_then(Value::as_str).unwrap_or("") {
+                "weekly" => ("weekly", Some(7 * 24 * 60), "Weekly".into()),
+                "5h" => ("session", Some(5 * 60), "5h".into()),
+                "daily" => ("session", Some(24 * 60), "Daily".into()),
+                "" => ("session", None, id.to_string()),
+                other => ("other", None, other.to_string()),
+            };
+        let label = match group
+            .map(|g| g.trim_end_matches(" Models").trim())
+            .filter(|g| !g.is_empty())
+        {
+            Some(g) => format!("{g} · {span}"),
+            None => span,
+        };
+        let remaining = b
+            .get("remainingFraction")
+            .or_else(|| b.get("remaining_fraction"))
+            .and_then(Value::as_f64);
+        let mut w = json!({
+            "id": format!("quota_{id}"),
+            "label": label,
+            "kind": kind,
+            "used_percent": remaining.map(|r| ((1.0 - r) * 100.0).clamp(0.0, 100.0)),
+        });
+        if let Some(m) = mins {
+            w["duration_mins"] = json!(m);
+        }
+        if let Some(r) = b
+            .get("resetTime")
+            .or_else(|| b.get("reset_time"))
+            .and_then(Value::as_str)
+        {
+            w["resets_at"] = json!(r);
+        }
+        out.push(w);
+    };
+    for g in q.get("groups").and_then(Value::as_array).unwrap_or(&empty) {
+        let name = g.get("displayName").and_then(Value::as_str);
+        for b in g.get("buckets").and_then(Value::as_array).unwrap_or(&empty) {
+            push(name, b);
+        }
+    }
+    for b in q.get("buckets").and_then(Value::as_array).unwrap_or(&empty) {
+        push(None, b);
+    }
+    out
 }
 
 /// The chat fold saw a quota wall: stamp it for `provider/usage`.
@@ -121,13 +221,20 @@ fn post(access: &str, method: &str, body: &str) -> Result<Value, String> {
         .post(&format!("{CLOUDCODE}:{method}"))
         .set("Authorization", &format!("Bearer {access}"))
         .set("Content-Type", "application/json")
+        // The backend keys the account view on the client: under ureq's
+        // default agent `loadCodeAssist` answers only the tier catalogue
+        // (no current tier, no project), so the quota call never ran.
+        .set("User-Agent", "antigravity")
         .send_string(body)
     {
         Ok(r) => serde_json::from_str(&r.into_string().map_err(|e| e.to_string())?)
             .map_err(|e| e.to_string()),
         Err(ureq::Error::Status(code, r)) => {
             let b = r.into_string().unwrap_or_default();
-            Err(format!("{method} HTTP {code}: {}", b.chars().take(160).collect::<String>()))
+            Err(format!(
+                "{method} HTTP {code}: {}",
+                b.chars().take(160).collect::<String>()
+            ))
         }
         Err(e) => Err(format!("{method}: {e}")),
     }
@@ -137,9 +244,9 @@ fn post(access: &str, method: &str, body: &str) -> Result<Value, String> {
 /// `retrieveUserQuotaSummary` lists per-model buckets. First 401 retry
 /// refreshes the bearer once.
 fn probe() -> Result<Value, String> {
-    let (mut access, _refresh) =
-        read_token().ok_or_else(|| "no agy credential".to_string())?;
-    let meta = r#"{"metadata":{"ideType":"ANTIGRAVITY","platform":"LINUX_AMD64","pluginType":"GEMINI"}}"#;
+    let (mut access, _refresh) = read_token().ok_or_else(|| "no agy credential".to_string())?;
+    let meta =
+        r#"{"metadata":{"ideType":"ANTIGRAVITY","platform":"LINUX_AMD64","pluginType":"GEMINI"}}"#;
     let mut lca = post(&access, "loadCodeAssist", meta);
     // 401 → the stored bearer is stale and `agy` owns the refresh grant;
     // re-read once in case a concurrent `agy` run just rewrote the file.
@@ -153,40 +260,24 @@ fn probe() -> Result<Value, String> {
     }
     let lca = lca?;
     let plan = lca
-        .pointer("/currentTier/name")
+        .pointer("/paidTier/name")
+        .or_else(|| lca.pointer("/currentTier/name"))
         .and_then(Value::as_str)
         .map(str::to_string);
     let project = lca
         .get("cloudaicompanionProject")
-        .and_then(Value::as_str)
+        .and_then(|p| p.as_str().or_else(|| p.get("id").and_then(Value::as_str)))
         .unwrap_or_default()
         .to_string();
 
-    let mut windows = Vec::new();
-    if !project.is_empty() {
+    let windows = if project.is_empty() {
+        Vec::new()
+    } else {
         let body = json!({"project": project}).to_string();
-        if let Ok(q) = post(&access, "retrieveUserQuotaSummary", &body) {
-            for b in q.get("buckets").and_then(Value::as_array).cloned().unwrap_or_default() {
-                let model = b
-                    .get("modelId")
-                    .or_else(|| b.get("model"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("model");
-                let remaining = b
-                    .get("remainingFraction")
-                    .or_else(|| b.get("remaining_fraction"))
-                    .and_then(Value::as_f64);
-                windows.push(json!({
-                    "id": format!("quota_{model}"),
-                    "label": model,
-                    "kind": "session",
-                    "used_percent": remaining.map(|r| (100.0 - r * 100.0).max(0.0)),
-                    "resets_at": b.get("resetTime").or_else(|| b.get("reset_time"))
-                        .and_then(Value::as_str).map(str::to_string),
-                }));
-            }
-        }
-    }
+        post(&access, "retrieveUserQuotaSummary", &body)
+            .map(|q| quota_windows(&q))
+            .unwrap_or_default()
+    };
     Ok(json!({
         "available": true,
         "title": "Antigravity",
@@ -207,7 +298,10 @@ pub fn handle() -> Result<Value, ProviderRpcError> {
         // A live answer still merges a fresh quota event on top — the
         // probe's buckets don't see a very recent wall hit.
         if let Some(event) = read_event()
-            && limits["windows"].as_array().map(|w| w.is_empty()).unwrap_or(true)
+            && limits["windows"]
+                .as_array()
+                .map(|w| w.is_empty())
+                .unwrap_or(true)
         {
             limits["windows"] = json!([event_window(&event)]);
             limits["note"] = event["detail"].clone();
@@ -241,4 +335,55 @@ fn event_window(_event: &Value) -> Value {
         "kind": "session",
         "used_percent": 100.0,
     })
+}
+
+#[cfg(test)]
+mod quota_tests {
+    use super::*;
+
+    #[test]
+    fn grouped_buckets_become_labelled_windows() {
+        let q = json!({"groups": [
+            {"displayName": "Gemini Models", "buckets": [
+                {"bucketId": "gemini-weekly", "window": "weekly",
+                 "resetTime": "2026-10-15T17:49:04Z", "remainingFraction": 0.75},
+                {"bucketId": "gemini-5h", "window": "5h",
+                 "resetTime": "2026-10-11T16:12:45Z", "remainingFraction": 1}]},
+            {"displayName": "Third Party Models", "buckets": [
+                {"bucketId": "3p-weekly", "window": "weekly", "remainingFraction": 1}]}
+        ]});
+        let w = quota_windows(&q);
+        let labels: Vec<&str> = w.iter().map(|w| w["label"].as_str().unwrap()).collect();
+        assert_eq!(
+            labels,
+            vec!["Gemini · Weekly", "Gemini · 5h", "Third Party · Weekly"]
+        );
+        assert_eq!(w[0]["used_percent"], 25.0);
+        assert_eq!(w[0]["kind"], "weekly");
+        assert_eq!(w[0]["resets_at"], "2026-10-15T17:49:04Z");
+        assert_eq!(w[1]["used_percent"], 0.0);
+        assert_eq!(w[1]["duration_mins"], 300);
+        assert!(w[2].get("resets_at").is_none());
+    }
+
+    #[test]
+    fn flat_buckets_and_empty_payloads_still_map() {
+        let w = quota_windows(&json!({"buckets": [{"modelId": "m", "remainingFraction": 0.5}]}));
+        assert_eq!(w[0]["label"], "m");
+        assert_eq!(w[0]["used_percent"], 50.0);
+        assert!(quota_windows(&json!({})).is_empty());
+    }
+
+    #[test]
+    fn token_parses_from_the_agy_envelope() {
+        let raw = r#"{"auth_method":"consumer","token":{"access_token":"a","refresh_token":"r"}}"#;
+        assert_eq!(parse_token(raw), Some(("a".into(), Some("r".into()))));
+        assert_eq!(parse_token("not json"), None);
+    }
+
+    #[test]
+    #[ignore]
+    fn live() {
+        println!("LIVE {}", handle().unwrap());
+    }
 }

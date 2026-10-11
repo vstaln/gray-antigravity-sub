@@ -13,4 +13,5 @@ pub mod setup;
 
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub mod status;
 pub mod usage;
