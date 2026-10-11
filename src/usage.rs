@@ -250,13 +250,13 @@ fn probe() -> Result<Value, String> {
     let mut lca = post(&access, "loadCodeAssist", meta);
     // 401 → the stored bearer is stale and `agy` owns the refresh grant;
     // re-read once in case a concurrent `agy` run just rewrote the file.
-    if lca.is_err() && lca.as_ref().unwrap_err().contains("401") {
-        if let Some((fresh, _)) = read_token()
-            && fresh != access
-        {
-            access = fresh;
-            lca = post(&access, "loadCodeAssist", meta);
-        }
+    if lca.is_err()
+        && lca.as_ref().unwrap_err().contains("401")
+        && let Some((fresh, _)) = read_token()
+        && fresh != access
+    {
+        access = fresh;
+        lca = post(&access, "loadCodeAssist", meta);
     }
     let lca = lca?;
     let plan = lca

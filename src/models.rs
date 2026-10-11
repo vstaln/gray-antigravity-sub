@@ -57,12 +57,12 @@ pub fn catalog() -> ProviderModelCatalog {
 pub(crate) fn catalog_in(snap: &catalog::Snapshot) -> ProviderModelCatalog {
     let mut models: Vec<ProviderModel> = Vec::new();
     let mut family_row: BTreeMap<String, usize> = BTreeMap::new();
-    for id in catalog::all_ids_in(&snap) {
+    for id in catalog::all_ids_in(snap) {
         let group = snap.is_routable(&id).then(|| split_tier(&id)).flatten();
         let Some((base, tier)) = group else {
             models.push(ProviderModel {
-                name: catalog::display_name_in(&snap, &id),
-                context_window: catalog::context_window_in(&snap, &id),
+                name: catalog::display_name_in(snap, &id),
+                context_window: catalog::context_window_in(snap, &id),
                 reasoning_efforts: Vec::new(),
                 id,
                 variants: vec![],
@@ -78,7 +78,7 @@ pub(crate) fn catalog_in(snap: &catalog::Snapshot) -> ProviderModelCatalog {
                 // family row instead of duplicating.
                 let i = models.iter().position(|m| m.id == base).unwrap_or_else(|| {
                     models.push(ProviderModel {
-                        name: family_name_in(&snap, &base),
+                        name: family_name_in(snap, &base),
                         context_window: None,
                         reasoning_efforts: Vec::new(),
                         id: base.clone(),
@@ -93,7 +93,7 @@ pub(crate) fn catalog_in(snap: &catalog::Snapshot) -> ProviderModelCatalog {
         };
         let row = &mut models[idx];
         if row.context_window.is_none() {
-            row.context_window = catalog::context_window_in(&snap, &id);
+            row.context_window = catalog::context_window_in(snap, &id);
         }
         row.variants.push(ModelVariant {
             id: id.clone(),

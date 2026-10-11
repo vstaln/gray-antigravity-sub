@@ -286,12 +286,14 @@ fn find(
     Err(reason)
 }
 
+type Taken = Option<(Arc<Mutex<LiveSession>>, String)>;
+
 /// Take the pooled session this turn continues (see [`find`]), plus the
 /// delta to prompt with. While a session that could answer it is out for
 /// a keepalive, wait for it to come back — up to `KEEPALIVE_WAIT` —
 /// rather than miss and re-bill the whole transcript on a fresh child.
 /// On a miss the second item is the reason.
-fn take(turn: &PreparedTurn) -> (Option<(Arc<Mutex<LiveSession>>, String)>, &'static str) {
+fn take(turn: &PreparedTurn) -> (Taken, &'static str) {
     let deadline = Instant::now() + KEEPALIVE_WAIT;
     let mut dead = Vec::new();
     let result = {
@@ -761,7 +763,7 @@ impl LiveSession {
                             .iter()
                             .rev()
                             .find_map(|v| v.pointer("/result/usage").or_else(|| v.get("usage")))
-                            .map(|u| chat::map_usage(u))
+                            .map(chat::map_usage)
                             .as_ref(),
                         None,
                     );
