@@ -151,11 +151,6 @@ pub enum LoginState {
 /// remembered for the sidecar's lifetime; `LoggedOut`/`Unknown` are never
 /// cached so a fresh login is picked up on the next probe.
 pub fn probe_login() -> LoginState {
-    static LOGGED_IN: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-    if LOGGED_IN.load(std::sync::atomic::Ordering::Relaxed) {
-        return LoginState::LoggedIn;
-    }
     // No token file: logged out without spawning (and without any browser).
     // The probe never reads token bytes; it only checks the file exists,
     // then lets the user's own CLI answer through the staged symlink.
@@ -163,6 +158,13 @@ pub fn probe_login() -> LoginState {
         Some(path) => path,
         None => return LoginState::LoggedOut,
     };
+    // A remembered login is checked only after the token file: a removed
+    // token must read as logged out, not as the cached answer.
+    static LOGGED_IN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    if LOGGED_IN.load(std::sync::atomic::Ordering::Relaxed) {
+        return LoginState::LoggedIn;
+    }
     let binary = match resolve_command() {
         Some(b) => b,
         None => return LoginState::Unknown,

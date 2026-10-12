@@ -12,22 +12,18 @@
 
 `gray-antigravity-sub` drives the official `agy` CLI fully inert (staged HOME, `request-review` skeleton, `--disable-slash-commands`, `--json-schema` funnel — `agy` owns zero tools of gray's) as a request-scoped model provider. Gray owns the agent loop, tools, approvals, and compaction — Antigravity only answers.
 
-## Why this is ToS-safe (no bans)
+## How the plugin uses your login
 
-The Antigravity proxy ecosystem (`antigravity-proxy`, `opencode-antigravity-auth` and forks) extracts the Google OAuth token and replays Google's internal RPC protocols as an OpenAI-compatible proxy, with account rotation and quota dashboards. That pattern violates Google's Terms of Service — the opencode plugin's own README warns users have been **banned or shadow-banned** for it.
-
-This connector does none of that:
-
-* **Zero token handling**: uses your existing `agy` Google sign-in (OS keyring + browser). Token bytes are never opened, copied, logged, or forwarded — auth reaches the child through a staged-HOME symlink to your own `~/.gemini/antigravity-cli` dir.
-* **Official CLI only**: every turn is one `agy --model <full-id> --disable-slash-commands --input-format stream-json --output-format stream-json --json-schema … -p ''` subprocess — the same binary Google ships, driven the way its own docs describe.
-* **No rotation, no quota tooling, no internal endpoints**: one login, one provider request per turn (admission relay), quota errors surface as clean `RateLimited` instead of failover schemes.
+* **No token reads by the plugin**: it never reads, copies, logs, or forwards agy's OAuth token. It checks that agy's token file exists and symlinks it into a staged HOME, so the official `agy` CLI can sign in with your own login.
+* **Official CLI only**: every turn is one `agy --model <full-id> --disable-slash-commands --input-format stream-json --output-format stream-json --json-schema … -p ''` subprocess, the same binary Google ships, driven the way its own docs describe.
+* **No internal endpoints, no quota API, no account rotation**: the plugin makes no direct calls to Google's services. The usage card shows a quota row only after agy reports a quota wall in its output.
 * **Fail-closed**: gateway/proxy env overrides (`AGY_LLM_GATEWAY_*`, `GEMINI_API_KEY`, `GOOGLE_GEMINI_BASE_URL`, …) refuse to spawn rather than redirect the subscription bearer.
 
 ---
 
 ## Highlights
 
-* **Zero Token / Credential Leaks**: Uses your existing `agy` sign-in. Never handles, stores, or logs API keys or tokens.
+* **No Token Handling**: Uses your existing `agy` sign-in. The plugin never reads, stores, or logs API keys or tokens.
 * **Single-Request Admission Relay**: Drives an internal request-scoped loopback admission relay that enforces exactly one provider request per turn and absorbs redundant recovery attempts.
 * **Finish Funnel**: Gray tools are described in the system text and answered through a single `finish(answer, calls[])` JSON-schema tool — `agy` never sees a real tool. A turn with no `finish` call is incomplete, never an answer.
 * **Pinned Model Catalog**: Full `agy models` ids (`gemini-3.8-flash-low`, `claude-sonnet-5-5-low`, …) with windows, never guessed (`gpt-oss-120b-medium` reports `None`). Full ids already encode effort, so there is no effort knob.
