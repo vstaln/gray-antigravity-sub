@@ -1,23 +1,28 @@
-pub const RECORDS: [&str; 6] = [
+pub const RECORDS: [&str; 5] = [
     "[User]",
     "[Assistant]",
     "[Assistant reasoning]",
     "[System]",
-    "[Tool call ",
     "[Tool result ",
 ];
 
 const LABEL: &str = "[Assistant]";
+const SALVAGE: [&str; 2] = ["[Tool call ", "{\"calls\""];
 
 #[derive(Default, Clone, Debug)]
 pub struct TurnGuard {
     scanned: usize,
     cut: Option<&'static str>,
+    salvage: Option<usize>,
 }
 
 impl TurnGuard {
     pub fn cut(&self) -> Option<&'static str> {
         self.cut
+    }
+
+    pub fn salvage(&self) -> Option<usize> {
+        self.salvage
     }
 
     pub fn feed(&mut self, text: &mut String) -> Option<&'static str> {
@@ -41,6 +46,9 @@ impl TurnGuard {
                 text.truncate(self.scanned);
                 self.cut = Some(*m);
                 return self.cut;
+            }
+            if self.salvage.is_none() && SALVAGE.iter().any(|m| head.starts_with(*m)) {
+                self.salvage = Some(self.scanned);
             }
             if !complete {
                 return None;

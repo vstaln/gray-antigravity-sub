@@ -118,10 +118,11 @@ fn item_kind(item: &Value) -> &str {
     }
 }
 
-/// Render one Responses `input` item to transcript text. Tool calls and
-/// results render as explicit records so the model can reference them;
-/// reasoning carriers restore nothing (agy has no replay) but their text
-/// still carries the prior answer.
+/// Render one Responses `input` item to transcript text. Tool calls render
+/// as the `{"calls":[…]}` envelope finish takes and results as explicit
+/// records so the model can reference them; reasoning carriers restore
+/// nothing (agy has no replay) but their text still carries the prior
+/// answer.
 fn render_item(item: &Value) -> Option<String> {
     let kind = item_kind(item);
     match kind {
@@ -138,12 +139,7 @@ fn render_item(item: &Value) -> Option<String> {
             };
             Some(format!("[{who}]\n{text}"))
         }
-        "function_call" => {
-            let name = item.get("name").and_then(Value::as_str).unwrap_or("?");
-            let args = item.get("arguments").and_then(Value::as_str).unwrap_or("");
-            let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
-            Some(format!("[Tool call {name} id={call_id}]\n{args}"))
-        }
+        "function_call" => Some(format!("[Assistant]\n{}", calls_block(&[item]))),
         "function_call_output" => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
             let out = item
@@ -178,13 +174,61 @@ fn render_item(item: &Value) -> Option<String> {
     }
 }
 
+fn call_object(item: &Value) -> String {
+    let name = item.get("name").and_then(Value::as_str).unwrap_or("?");
+    let args = match item.get("arguments") {
+        Some(Value::String(raw)) => {
+            serde_json::from_str::<Value>(raw).unwrap_or_else(|_| Value::String(raw.clone()))
+        }
+        Some(v) => v.clone(),
+        None => json!({}),
+    };
+    format!(
+        "{{\"tool\":{},\"args\":{}}}",
+        Value::String(name.to_string()),
+        args
+    )
+}
+
+fn calls_block(calls: &[&Value]) -> String {
+    let body = calls
+        .iter()
+        .map(|c| call_object(c))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{{\"calls\":[{body}]}}")
+}
+
 /// Render a Responses `input` array to transcript text.
 fn render_items(items: &[Value]) -> String {
-    items
-        .iter()
-        .filter_map(render_item)
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    let mut records: Vec<String> = Vec::new();
+    let mut open_assistant = false;
+    let mut i = 0;
+    while i < items.len() {
+        let item = &items[i];
+        if item_kind(item) == "function_call" {
+            let mut calls = vec![item];
+            while i + 1 < items.len() && item_kind(&items[i + 1]) == "function_call" {
+                i += 1;
+                calls.push(&items[i]);
+            }
+            let block = calls_block(&calls);
+            match records.last_mut() {
+                Some(last) if open_assistant => {
+                    last.push_str("\n\n");
+                    last.push_str(&block);
+                }
+                _ => records.push(format!("[Assistant]\n{block}")),
+            }
+            open_assistant = false;
+        } else if let Some(r) = render_item(item) {
+            open_assistant = item_kind(item) == "message"
+                && item.get("role").and_then(Value::as_str) == Some("assistant");
+            records.push(r);
+        }
+        i += 1;
+    }
+    records.join("\n\n")
 }
 
 /// Translate an OpenAI Responses body into one funnel turn.
@@ -469,6 +513,79 @@ pub fn credential_file() -> Option<std::path::PathBuf> {
     file.is_file().then_some(file)
 }
 
+fn json_value_prefix(s: &str) -> Option<(Value, usize)> {
+    let mut stream = serde_json::Deserializer::from_str(s).into_iter::<Value>();
+    let v = stream.next()?.ok()?;
+    Some((v, stream.byte_offset()))
+}
+
+pub(crate) fn salvage_calls(text: &str) -> Vec<Value> {
+    enum Hit {
+        Record { name: String, after: usize },
+        Envelope { at: usize, after: usize },
+    }
+    let mut calls = Vec::new();
+    let mut rest = text;
+    loop {
+        let mut hit = None;
+        let mut off = 0;
+        for line in rest.split_inclusive('\n') {
+            let head = line.trim_start_matches([' ', '\t']);
+            if let Some(inner) = head.strip_prefix("[Tool call ") {
+                let name = inner
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches(']')
+                    .to_string();
+                hit = Some(Hit::Record {
+                    name,
+                    after: off + line.len(),
+                });
+                break;
+            }
+            if head.starts_with("{\"calls\"") {
+                hit = Some(Hit::Envelope {
+                    at: off + line.len() - head.len(),
+                    after: off + line.len(),
+                });
+                break;
+            }
+            off += line.len();
+        }
+        match hit {
+            None => break,
+            Some(Hit::Record { name, after }) => {
+                rest = &rest[after..];
+                if name.is_empty() {
+                    continue;
+                }
+                let mut body = rest.trim_start();
+                if let Some(fenced) = body.strip_prefix("```") {
+                    body = fenced.strip_prefix("json").unwrap_or(fenced).trim_start();
+                }
+                match json_value_prefix(body) {
+                    Some((args, used)) => {
+                        calls.push(json!({"tool": name, "args": args}));
+                        rest = &body[used..];
+                    }
+                    None => calls.push(json!({"tool": name, "args": {}})),
+                }
+            }
+            Some(Hit::Envelope { at, after }) => match json_value_prefix(&rest[at..]) {
+                Some((v, used)) => {
+                    if let Some(arr) = v.get("calls").and_then(Value::as_array) {
+                        calls.extend(arr.iter().cloned());
+                    }
+                    rest = &rest[at + used..];
+                }
+                None => rest = &rest[after..],
+            },
+        }
+    }
+    calls
+}
+
 /// Fold native stream-json lines into a Responses SSE stream.
 /// Returns (sse_bytes, natives, text, calls, usage, stop_reason).
 ///
@@ -647,29 +764,48 @@ pub fn fold_lines(
         })
         .unwrap_or("")
         .to_string();
-    let (answer, cut) = crate::guard::cut_transcript(&answer);
+    let mut guarded = answer;
+    let mut guard = crate::guard::TurnGuard::default();
+    let cut = guard.feed(&mut guarded);
     if let Some(m) = cut {
         eprintln!(
             "antigravity-sub: answer cut at fabricated {} record (offset {})",
             crate::guard::marker_name(m),
-            answer.len()
+            guarded.len()
         );
     }
-    let answer = crate::guard::strip_reasoning(&answer).trim().to_string();
-    let has_calls = args
-        .get("calls")
-        .and_then(Value::as_array)
-        .is_some_and(|c| !c.is_empty());
-    if answer.is_empty() && (cut.is_none() || !has_calls) {
-        return Err("incomplete native response: finish carried no answer".into());
-    }
-    say(format!("…{answer}"));
-    let mut calls: Vec<(String, String, String)> = Vec::new();
-    let wanted = args
+    let salvage = guard.salvage();
+    let mut wanted = args
         .get("calls")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
+    if let Some(at) = salvage {
+        let tail = guarded.split_off(at);
+        let salvaged = if wanted.is_empty() {
+            salvage_calls(&tail)
+        } else {
+            Vec::new()
+        };
+        if salvaged.is_empty() {
+            eprintln!(
+                "antigravity-sub: answer cut at fabricated Tool_call record (offset {at})"
+            );
+        } else {
+            eprintln!(
+                "antigravity-sub: salvaged {} fabricated Tool_call record(s) (offset {at})",
+                salvaged.len()
+            );
+            wanted = salvaged;
+        }
+    }
+    let answer = crate::guard::strip_reasoning(&guarded).trim().to_string();
+    let has_calls = !wanted.is_empty();
+    if answer.is_empty() && !(has_calls && (cut.is_some() || salvage.is_some())) {
+        return Err("incomplete native response: finish carried no answer".into());
+    }
+    say(format!("…{answer}"));
+    let mut calls: Vec<(String, String, String)> = Vec::new();
     // Unique per fold, not per-turn deterministic: pooled sessions answer
     // several turns, and identical call ids across turns would make the
     // echoed history ambiguous (and collide in the host transcript).
