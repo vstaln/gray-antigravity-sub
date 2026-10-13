@@ -231,6 +231,30 @@ fn render_items(items: &[Value]) -> String {
     records.join("\n\n")
 }
 
+/// The `finish` envelope every turn's `--json-schema` pins: a constant,
+/// so a child spawned idle for a re-warmed session ([`crate::live::rewarm`])
+/// carries the same one its next turn expects.
+pub(crate) fn finish_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string"},
+            "calls": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "tool": {"type": "string"},
+                        "args": {"type": "object"},
+                    },
+                    "required": ["tool"],
+                },
+            },
+        },
+        "required": ["answer"],
+    })
+}
+
 /// Translate an OpenAI Responses body into one funnel turn.
 pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     let instructions = body
@@ -339,24 +363,7 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     if !instructions.is_empty() {
         system_parts.push(instructions.to_string());
     }
-    let schema = json!({
-        "type": "object",
-        "properties": {
-            "answer": {"type": "string"},
-            "calls": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {
-                        "tool": {"type": "string"},
-                        "args": {"type": "object"},
-                    },
-                    "required": ["tool"],
-                },
-            },
-        },
-        "required": ["answer"],
-    });
+    let schema = finish_schema();
     Ok(PreparedTurn {
         system: system_parts.join("\n\n"),
         content_line: transcript,
@@ -456,11 +463,12 @@ pub struct TurnIsolation {
 
 impl TurnIsolation {
     /// Stage a fresh HOME: symlink just the user's `agy` OAuth token file
-    /// into it (auth without ever reading token bytes) and write the
-    /// skeleton settings.json. Verified: a staged HOME with only the token
-    /// link + skeleton authenticates and answers; conversations then land
-    /// in the staged HOME, never in the user's real store. Fails closed
-    /// when the token file is absent.
+    /// into it (auth without ever reading token bytes), write the
+    /// skeleton settings.json, and point `conversations/` at the plugin's
+    /// persistent store ([`crate::session`]) so a record can re-warm the
+    /// session after a restart. Verified: a staged HOME with only the
+    /// token link + skeleton authenticates and answers. Fails closed when
+    /// the token file is absent.
     pub fn stage() -> Result<Self, String> {
         let stage = tempfile::Builder::new()
             .prefix("antigravity-sub-")
@@ -470,7 +478,14 @@ impl TurnIsolation {
         let token_src = credential_file().ok_or_else(|| setup::LOGIN_HINT.to_string())?;
         let cli_dir = home.join(".gemini").join("antigravity-cli");
         std::fs::create_dir_all(&cli_dir).map_err(|e| format!("staging dir: {e}"))?;
-        link_token(&token_src, &cli_dir.join("antigravity-oauth-token"))?;
+        stage_link(&token_src, &cli_dir.join("antigravity-oauth-token"))?;
+        // `--conversation <sid>` resolves through this dir: symlinked into
+        // every staged HOME, transcripts outlive the session and the
+        // plugin process — what re-warming a record needs.
+        stage_link(
+            &crate::session::conversations_dir(),
+            &cli_dir.join("conversations"),
+        )?;
         std::fs::write(
             cli_dir.join("settings.json"),
             r#"{"toolPermission":"request-review"}"#,
@@ -485,15 +500,16 @@ impl TurnIsolation {
     }
 }
 
-/// Link the token file into the staged HOME. Unix-only in v1: Windows has
-/// no `HOME`-relocatable equivalent verified, so it fails closed there.
+/// Link the token file (or the conversations dir) into the staged HOME.
+/// Unix-only in v1: Windows has no `HOME`-relocatable equivalent verified,
+/// so it fails closed there.
 #[cfg(unix)]
-fn link_token(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
-    std::os::unix::fs::symlink(src, dst).map_err(|e| format!("staging auth: {e}"))
+fn stage_link(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    std::os::unix::fs::symlink(src, dst).map_err(|e| format!("staging link: {e}"))
 }
 
 #[cfg(not(unix))]
-fn link_token(_src: &std::path::Path, _dst: &std::path::Path) -> Result<(), String> {
+fn stage_link(_src: &std::path::Path, _dst: &std::path::Path) -> Result<(), String> {
     Err(
         "antigravity-sub staging is unix-only in v1 (token symlink); Windows support pending"
             .to_string(),
