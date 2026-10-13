@@ -48,6 +48,12 @@ fn pinned() -> &'static [(&'static str, Option<u32>)] {
         ("claude-sonnet-4-6", None),
         ("claude-opus-4-6-thinking", None),
         ("gpt-oss-120b-medium", None),
+        // Compiled into agy 1.3.4 (display name "Gemini 4 Argon") and
+        // offered by the Antigravity app, but `agy models` does not
+        // serve it and `--model gemini-4-argon` is rejected on this
+        // build — upstream-gated. Pinned so the id resolves and the
+        // offline fallback lists it; the window is unverified → None.
+        ("gemini-4-argon", None),
     ]
 }
 
