@@ -80,13 +80,11 @@ fn catalog_collapses_effort_tiers_into_family_rows() {
     assert_eq!(sonnet.context_window, None);
     assert!(sonnet.variants.is_empty());
     assert!(sonnet.reasoning_efforts.is_empty());
-    // The alias row resolves onto the live family member.
-    let alias = got
-        .models
-        .iter()
-        .find(|m| m.id == "sonnet")
-        .expect("sonnet alias in catalog");
-    assert_eq!(alias.name, "Claude Sonnet 4.6 (Thinking) (Antigravity)");
+    // Aliases are not listed: `sonnet` resolves to the already-listed
+    // `claude-sonnet-4-6` route — a second row would only duplicate its
+    // display name — and a dead-pin alias (`pro`) would show an
+    // unroutable "(unpinned)" id.
+    assert!(!got.models.iter().any(|m| m.id == "sonnet"));
     // Stale pinned ids are not advertised while discovery answers.
     assert!(!got.models.iter().any(|m| m.id == "claude-sonnet-5-5-low"));
 }

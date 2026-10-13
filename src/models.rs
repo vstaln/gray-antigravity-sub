@@ -48,8 +48,8 @@ fn family_name_in(snap: &catalog::Snapshot, base: &str) -> String {
 
 /// The catalog: one row per base model — effort-suffixed ids collapse
 /// under their family with each tier a declared variant — plus the
-/// tierless ids and aliases as plain rows. One snapshot covers the whole
-/// listing so a mid-build cache refresh cannot mix generations.
+/// tierless ids as plain rows. One snapshot covers the whole listing so
+/// a mid-build cache refresh cannot mix generations.
 pub fn catalog() -> ProviderModelCatalog {
     catalog_in(&catalog::Snapshot::current())
 }
@@ -58,8 +58,15 @@ pub(crate) fn catalog_in(snap: &catalog::Snapshot) -> ProviderModelCatalog {
     let mut models: Vec<ProviderModel> = Vec::new();
     let mut family_row: BTreeMap<String, usize> = BTreeMap::new();
     for id in catalog::all_ids_in(snap) {
-        let group = snap.is_routable(&id).then(|| split_tier(&id)).flatten();
-        let Some((base, tier)) = group else {
+        // Only routable ids earn a row. An alias either resolves onto an
+        // already-listed member — a second row for the same route with
+        // the same display name — or onto a dead pin, an unroutable id
+        // the picker would show as "(unpinned)". Aliases still resolve
+        // through `native_model`; they just aren't listed.
+        if !snap.is_routable(&id) {
+            continue;
+        }
+        let Some((base, tier)) = split_tier(&id) else {
             models.push(ProviderModel {
                 name: catalog::display_name_in(snap, &id),
                 context_window: catalog::context_window_in(snap, &id),
