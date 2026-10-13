@@ -59,12 +59,12 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Once, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{Value, json};
 
 use crate::chat::{self, PreparedTurn, TurnIsolation, Usage};
-use crate::setup;
+use crate::{session, setup};
 
 /// Pool bound: at most this many idle `agy` children.
 const MAX_LIVE: usize = 4;
@@ -102,6 +102,16 @@ const CLOSE_GRACE: Duration = Duration::from_secs(2);
 /// After a settled-but-failed result the child usually exits: this grace
 /// lets the wire prove death (EOF) before the session is called alive.
 const ERROR_GRACE: Duration = Duration::from_millis(800);
+/// A re-warmed child must announce its `init` line within this window —
+/// a silent resume (a refused `--conversation`, a dead spawn) is dropped
+/// un-pooled and its record is left for the sweep.
+const REWARM_INIT_WAIT: Duration = Duration::from_secs(30);
+/// Records fresher than this re-pool at startup. claude-sub bounds its
+/// window by the provider's ~1h cache TTL (6h); Gemini's implicit cache
+/// lives ~minutes and the reaper closes a session idle past `IDLE_TTL`
+/// anyway, so the binding limit here is the pool's own idle lifetime —
+/// an older record would only spawn a child the reaper closes on arrival.
+const REWARM_WINDOW: Duration = IDLE_TTL;
 
 /// One stdout line, parsed: `Err` is a garbage line (dead wire).
 type PumpMsg = Result<Value, String>;
@@ -145,6 +155,11 @@ pub struct LiveSession {
     keepalive_disabled: bool,
     /// Wire went dead or we killed the child: never re-pool.
     dead: bool,
+    /// Re-pooled from a persisted record after a plugin restart — its
+    /// first real turn is the resume's proof: a dead wire there means a
+    /// stale record, so the turn falls back to a fresh child instead of
+    /// failing.
+    rewarmed: bool,
     /// Keeps the staged HOME alive for the child's whole life.
     _isolation: TurnIsolation,
 }
@@ -500,12 +515,14 @@ pub fn shutdown_all() {
     POOL_CHANGED.notify_all();
 }
 
-/// Spawn a fresh `agy` child under a staged HOME (one staging per
-/// session now, not per turn) with a stdout pump feeding parsed
-/// stream-json lines. The argv is the old one-shot contract —
-/// `--json-schema` forcing the `{answer, calls[]}` envelope — minus the
-/// stdin close: this child answers every turn of the conversation.
-fn spawn(turn: &PreparedTurn) -> Result<Arc<Mutex<LiveSession>>, String> {
+/// Spawn an `agy` child under a staged HOME (one staging per session
+/// now, not per turn) with a stdout pump feeding parsed stream-json
+/// lines. The argv is the old one-shot contract — `--json-schema`
+/// forcing the `{answer, calls[]}` envelope — minus the stdin close:
+/// this child answers every turn of the conversation. `resume` reopens
+/// `agy`'s persisted conversation (`--conversation <sid>`) instead of
+/// starting a fresh one — [`rewarm`] passes it, turns never do.
+fn spawn(turn: &PreparedTurn, resume: Option<&str>) -> Result<Arc<Mutex<LiveSession>>, String> {
     if let Some(key) = setup::conflicting_env() {
         return Err(format!(
             "subscription provider refuses conflicting {key}: unset it so native uses your Antigravity login"
@@ -515,20 +532,23 @@ fn spawn(turn: &PreparedTurn) -> Result<Arc<Mutex<LiveSession>>, String> {
     let schema_str =
         serde_json::to_string(&turn.schema).map_err(|e| format!("schema encode: {e}"))?;
     let isolation = TurnIsolation::stage()?;
+    let mut args: Vec<&str> = vec![
+        "--model",
+        turn.native_model.as_str(),
+        "--disable-slash-commands",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--json-schema",
+        schema_str.as_str(),
+    ];
+    if let Some(sid) = resume {
+        args.extend(["--conversation", sid]);
+    }
+    args.extend(["-p", ""]);
     let mut child = Command::new(&binary)
-        .args([
-            "--model",
-            turn.native_model.as_str(),
-            "--disable-slash-commands",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--json-schema",
-            schema_str.as_str(),
-            "-p",
-            "",
-        ])
+        .args(&args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -576,8 +596,90 @@ fn spawn(turn: &PreparedTurn) -> Result<Arc<Mutex<LiveSession>>, String> {
         keepalive_turns: 0,
         keepalive_disabled: false,
         dead: false,
+        rewarmed: false,
         _isolation: isolation,
     })))
+}
+
+/// Re-pool one persisted session after a plugin restart: spawn `agy`
+/// `--conversation`-resumed at the record's point but leave it idle —
+/// the transcript already holds the conversation, so nothing is written
+/// to stdin. The strict-continuation fields are restored from the record
+/// so the next turn matches it like a still-pooled session. `None` when
+/// the resume can't mount — the record is simply never pooled.
+fn spawn_idle(rec: &session::Record) -> Option<Arc<Mutex<LiveSession>>> {
+    if !session::session_exists(&rec.sid) {
+        return None;
+    }
+    let turn = PreparedTurn {
+        system: rec.system.clone(),
+        content_line: String::new(),
+        input: Vec::new(),
+        schema: chat::finish_schema(),
+        names: Vec::new(),
+        native_model: rec.model.clone(),
+    };
+    let arc = spawn(&turn, Some(&rec.sid)).ok()?;
+    let mut s = lock(&arc);
+    // A mounted child announces `init` then idles on stdin; a refused
+    // resume or a dead spawn surfaces as an early line/EOF — nothing
+    // pooled, nothing poisoned. The announced conversation must be the
+    // record's own.
+    let mounted = matches!(
+        s.rx.recv_timeout(REWARM_INIT_WAIT),
+        Ok(Ok(ref v))
+            if v.get("event").or_else(|| v.get("type")).and_then(Value::as_str) == Some("init")
+                && chat::conversation_of(v) == rec.sid
+    );
+    if !mounted {
+        s.close();
+        return None;
+    }
+    s.absorbed = rec.absorbed.clone();
+    s.reply_call_ids = rec.reply_call_ids.clone();
+    s.reply_text = rec.reply_text.clone();
+    s.conversation_id = rec.sid.clone();
+    s.rewarmed = true;
+    // Restore the clocks from the record's age: the idle TTL and the
+    // keepalive cadence resume where they left off.
+    let age = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+        .saturating_sub(rec.saved_at);
+    let ago = Instant::now().checked_sub(Duration::from_secs(age));
+    s.last_used = ago.unwrap_or_else(Instant::now);
+    s.last_contact = ago;
+    drop(s);
+    Some(arc)
+}
+
+/// Re-pool sessions whose records are still inside the warm window. A
+/// plugin restart used to strand them: the pool died with the process
+/// and each conversation's upstream cache entry lapsed before its next
+/// turn, so a restart re-billed every warm transcript. Spawned idle
+/// here, the resumed children rejoin the keepalive cycle — and their
+/// next turn still matches as a strict continuation instead of replaying
+/// history cold. Runs once at startup on a background thread; spawn
+/// failures stay silent — the request just falls back to a cold spawn.
+pub fn rewarm() {
+    let mut warmed = Vec::new();
+    for (rec, age) in session::records() {
+        if warmed.len() >= MAX_LIVE || age > REWARM_WINDOW {
+            break;
+        }
+        // A legacy bare-sid point carries no continuation state (a real
+        // record always has the funnel's non-empty system text).
+        if rec.system.is_empty() {
+            continue;
+        }
+        if let Some(arc) = spawn_idle(&rec) {
+            warmed.push(arc);
+        }
+    }
+    if !warmed.is_empty() {
+        locked_pool().live.extend(warmed);
+    }
 }
 
 /// The stdout pump: one parsed stream-json value per line, a `PumpMsg`
@@ -862,14 +964,21 @@ pub fn run_turn(
         let mut s = lock(&arc);
         match s.send_content(&delta) {
             Ok(()) => {
+                let rewarmed = s.rewarmed;
                 let out = settle(&mut s, &turn, &say, deadline);
                 trace_result("reuse", &s, chars, &out);
-                let poolable = !s.dead;
+                let died = s.dead;
                 drop(s);
-                if poolable {
+                if !died {
                     give_back(arc);
                 }
-                return out;
+                match out {
+                    // A re-warmed child's first drain proves the resume:
+                    // a dead wire there means a stale record, not a bad
+                    // request — replay the transcript on a fresh child.
+                    Err(_) if rewarmed && died => reason = "rewarm_dead",
+                    out => return out,
+                }
             }
             Err(_) => {
                 // The delta never reached the child (a partial line is
@@ -890,7 +999,7 @@ pub fn run_turn(
         format!("{}\n\n{}", turn.system, turn.content_line)
     };
     let chars = content.chars().count();
-    let arc = match spawn(&turn) {
+    let arc = match spawn(&turn, None) {
         Ok(arc) => arc,
         Err(e) => {
             trace(&mode, "-", chars, None, Some(&e));
@@ -936,6 +1045,7 @@ fn settle(
     match chat::fold_lines(&lines, &turn.names, say) {
         Ok((sse, _, text, calls, _, _)) => {
             s.absorb(turn, &text, &calls);
+            record(s);
             Ok(sse)
         }
         Err(e) => {
@@ -945,12 +1055,36 @@ fn settle(
                 // this warm child (well, misses and respawns — but a
                 // LATER distinct turn continues with only its tail).
                 s.absorb_failed(turn);
+                record(s);
             } else {
                 s.close();
             }
             Err(e)
         }
     }
+}
+
+/// Persist the session's pool record — the `--conversation` resume point
+/// plus the continuation state a restarted plugin re-pools from (see
+/// [`rewarm`]). Called on every settled turn: `s` has just absorbed the
+/// turn, so its fields are exactly what `continuation` verifies next.
+/// Best-effort — a lost write only costs the next restart its re-warm.
+fn record(s: &LiveSession) {
+    if s.conversation_id.is_empty() {
+        return;
+    }
+    session::save_record(&session::Record {
+        sid: s.conversation_id.clone(),
+        system: s.system.clone(),
+        model: s.native_model.clone(),
+        absorbed: s.absorbed.clone(),
+        reply_call_ids: s.reply_call_ids.clone(),
+        reply_text: s.reply_text.clone(),
+        saved_at: SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    });
 }
 
 /// Trace one turn outcome under `ANTIGRAVITY_SUB_DEBUG`.

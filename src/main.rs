@@ -76,6 +76,10 @@ async fn main() -> anyhow::Result<()> {
     std::thread::spawn(|| {
         let _ = antigravity_sub::discover::live();
     });
+    // Re-pool sessions persisted before a restart so their upstream
+    // prefix stays warm and the next turn continues them — best-effort,
+    // background.
+    std::thread::spawn(live::rewarm);
     let relays: Relays = Arc::new(Mutex::new(HashMap::new()));
     let mut lines =
         tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(tokio::io::stdin()));
