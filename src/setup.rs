@@ -160,8 +160,7 @@ pub fn probe_login() -> LoginState {
     };
     // A remembered login is checked only after the token file: a removed
     // token must read as logged out, not as the cached answer.
-    static LOGGED_IN: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    static LOGGED_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if LOGGED_IN.load(std::sync::atomic::Ordering::Relaxed) {
         return LoginState::LoggedIn;
     }

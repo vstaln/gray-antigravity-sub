@@ -430,12 +430,12 @@ fn take_keepalive() -> Option<Arc<Mutex<LiveSession>>> {
         })
         .collect();
     let i = snaps.iter().position(|snap| {
-        snap.as_ref().is_some_and(|(due, _, last_used, model, system)| {
-            *due
-                && !snaps.iter().flatten().any(|(_, dead2, lu, m, sys)| {
+        snap.as_ref()
+            .is_some_and(|(due, _, last_used, model, system)| {
+                *due && !snaps.iter().flatten().any(|(_, dead2, lu, m, sys)| {
                     !dead2 && m == model && sys == system && lu > last_used
                 })
-        })
+            })
     })?;
     let arc = pool.live.remove(i);
     let (native_model, system) = {

@@ -74,6 +74,7 @@ pub(crate) fn catalog_in(snap: &catalog::Snapshot) -> ProviderModelCatalog {
                 id,
                 variants: vec![],
                 slots: vec![],
+                price_cliff_tokens: None,
             });
             continue;
         };
@@ -91,6 +92,7 @@ pub(crate) fn catalog_in(snap: &catalog::Snapshot) -> ProviderModelCatalog {
                         id: base.clone(),
                         variants: vec![],
                         slots: vec![],
+                        price_cliff_tokens: None,
                     });
                     models.len() - 1
                 });
