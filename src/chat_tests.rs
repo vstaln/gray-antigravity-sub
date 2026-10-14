@@ -313,3 +313,43 @@ fn fold_rejects_double_finish() {
     let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
     assert!(fold_lines(&lines, &[], &say).is_err());
 }
+
+#[test]
+fn image_parts_render_as_omission_markers() {
+    let b = body(vec![json!({"type": "message", "role": "user", "content": [
+        {"type": "input_text", "text": "what is this?"},
+        {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
+    ]})]);
+    let turn = prepare_turn(&b, "flash").unwrap();
+    assert!(turn.content_line.contains("(image attachment omitted"));
+    assert!(turn.content_line.contains("what is this?"));
+    // The marker is a marker: no base64 blob reaches the transcript.
+    assert!(!turn.content_line.contains("iVBORw0KGgo="));
+    assert!(turn.system.contains("relays text only"));
+}
+
+#[test]
+fn image_only_message_still_reaches_the_model() {
+    // A pure-image turn used to render an empty transcript and die on
+    // "history must end in a nonempty user/tool-result message".
+    let b = body(vec![json!({"type": "message", "role": "user", "content": [
+        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+    ]})]);
+    let turn = prepare_turn(&b, "flash").unwrap();
+    assert!(turn.content_line.contains("[User]"));
+    assert!(turn.content_line.contains("(image attachment omitted"));
+}
+
+#[test]
+fn array_tool_output_never_dumps_base64() {
+    let b = body(vec![
+        json!({"type": "function_call_output", "call_id": "c1", "output": [
+            {"type": "input_text", "text": "shot taken"},
+            {"type": "input_image", "image_url": "data:image/png;base64,QUJD"},
+        ]}),
+    ]);
+    let turn = prepare_turn(&b, "flash").unwrap();
+    assert!(turn.content_line.contains("[Tool result id=c1]"));
+    assert!(turn.content_line.contains("shot taken"));
+    assert!(!turn.content_line.contains("QUJD"));
+}

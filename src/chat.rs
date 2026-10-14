@@ -13,6 +13,11 @@
 //!   persists across stdin lines in one process (same conversation_id,
 //!   earlier content is recalled), so a pooled session continuing a
 //!   history receives only the delta — see [`continuation`].
+//! * media parts (`input_image`, `input_file`, …) cannot cross the funnel:
+//!   `stream-json` input takes a string or text blocks only (verified on
+//!   `agy` 1.3.5 — everything else is rejected outright or ignored). They
+//!   render as `(… attachment omitted …)` markers so the model can say it
+//!   cannot see them instead of guessing or hunting for a file.
 //! * gray tools are NOT passed as native tools. They are described in the
 //!   system text and the `finish` JSON schema's `calls[]` array; `agy`
 //!   calls `finish(answer, calls)` once and gray executes the calls itself.
@@ -91,17 +96,43 @@ fn check_tool_name(name: &str, seen: &HashSet<String>) -> Result<(), String> {
     Ok(())
 }
 
+/// One content part to transcript text. Media parts the text-only funnel
+/// cannot carry render as explicit omission markers: the model must know
+/// an attachment existed and never reached it — one that silently vanishes
+/// reads as "no file arrived", and the model goes hunting for it.
+fn part_text(b: &Value) -> Option<String> {
+    match b.get("type").and_then(Value::as_str) {
+        // OpenAI Responses wire parts the host actually sends.
+        Some("text" | "input_text" | "output_text") => {
+            b.get("text").and_then(Value::as_str).map(str::to_string)
+        }
+        Some(other) => Some(match media_label(other) {
+            Some(label) => {
+                format!("({label} attachment omitted: this provider relays text only)")
+            }
+            None => format!("({other} part omitted: this provider relays text only)"),
+        }),
+        None => None,
+    }
+}
+
+/// Friendly noun for a media part type, when it is one.
+fn media_label(t: &str) -> Option<&'static str> {
+    Some(match t {
+        "input_image" | "image_url" | "image" => "image",
+        "input_audio" | "audio" => "audio",
+        "input_video" | "video" => "video",
+        "input_file" | "file" => "file",
+        _ => return None,
+    })
+}
+
 fn text_of(blocks: &Value) -> String {
     match blocks {
         Value::String(s) => s.clone(),
         Value::Array(arr) => arr
             .iter()
-            .filter_map(|b| match b.get("type").and_then(Value::as_str) {
-                Some("text") => b.get("text").and_then(Value::as_str),
-                // OpenAI Responses wire parts the host actually sends.
-                Some("input_text" | "output_text") => b.get("text").and_then(Value::as_str),
-                _ => None,
-            })
+            .filter_map(part_text)
             .collect::<Vec<_>>()
             .join(""),
         _ => String::new(),
@@ -142,12 +173,15 @@ fn render_item(item: &Value) -> Option<String> {
         "function_call" => Some(format!("[Assistant]\n{}", calls_block(&[item]))),
         "function_call_output" => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
+            // Structured output (content-part arrays) renders like message
+            // content — text joined, media marked omitted. Stringifying the
+            // raw JSON would dump base64 blobs into the transcript.
             let out = item
                 .get("output")
-                .map(|v| {
-                    v.as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| v.to_string())
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    Value::Array(_) => text_of(v),
+                    other => other.to_string(),
                 })
                 .unwrap_or_default();
             Some(format!("[Tool result id={call_id}]\n{out}"))
@@ -252,6 +286,24 @@ pub(crate) fn finish_schema() -> Value {
             },
         },
         "required": ["answer"],
+    })
+}
+
+/// True when any input item carries a non-text content part — a user
+/// attachment or a structured tool output the funnel can only mark omitted.
+fn drops_media(items: &[Value]) -> bool {
+    items.iter().any(|item| {
+        let content = match item_kind(item) {
+            "function_call_output" => item.get("output"),
+            _ => item.get("content"),
+        };
+        content.and_then(Value::as_array).is_some_and(|arr| {
+            arr.iter().any(|b| {
+                b.get("type")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| !matches!(t, "text" | "input_text" | "output_text"))
+            })
+        })
     })
 }
 
@@ -362,6 +414,13 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     }
     if !instructions.is_empty() {
         system_parts.push(instructions.to_string());
+    }
+    if drops_media(&input) {
+        system_parts.push(
+            "Attachments marked \"omitted\" never reached you: this funnel relays text only. \
+            Say you cannot see them — never pretend to, and never claim you found or opened the file."
+                .to_string(),
+        );
     }
     let schema = finish_schema();
     Ok(PreparedTurn {
@@ -804,9 +863,7 @@ pub fn fold_lines(
             Vec::new()
         };
         if salvaged.is_empty() {
-            eprintln!(
-                "antigravity-sub: answer cut at fabricated Tool_call record (offset {at})"
-            );
+            eprintln!("antigravity-sub: answer cut at fabricated Tool_call record (offset {at})");
         } else {
             eprintln!(
                 "antigravity-sub: salvaged {} fabricated Tool_call record(s) (offset {at})",
