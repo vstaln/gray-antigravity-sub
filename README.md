@@ -26,6 +26,7 @@
 * **No Token Handling**: Uses your existing `agy` sign-in. The plugin never reads, stores, or logs API keys or tokens.
 * **Single-Request Admission Relay**: Drives an internal request-scoped loopback admission relay that enforces exactly one provider request per turn and absorbs redundant recovery attempts.
 * **Finish Funnel**: Gray tools are described in the system text and answered through a single `finish(answer, calls[])` JSON-schema tool — `agy` never sees a real tool. A turn with no `finish` call is incomplete, never an answer.
+* **Image attachments**: Supported base64 PNG/JPEG/GIF/WebP data URLs are cached privately and exposed to `agy` as paths through a narrowly scoped native `read_file` permission. Remote URLs and unsupported media remain explicitly omitted.
 * **Pinned Model Catalog**: Full `agy models` ids (`gemini-3.8-flash-low`, `claude-sonnet-5-5-low`, …) with windows, never guessed (`gpt-oss-120b-medium` reports `None`). Full ids already encode effort, so there is no effort knob.
 
 ---

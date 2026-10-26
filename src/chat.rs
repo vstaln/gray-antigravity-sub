@@ -13,20 +13,26 @@
 //!   persists across stdin lines in one process (same conversation_id,
 //!   earlier content is recalled), so a pooled session continuing a
 //!   history receives only the delta — see [`continuation`].
+//! * media parts cannot cross the funnel: `stream-json` input takes a
+//!   string or text blocks only (verified on `agy` 1.3.5). Supported
+//!   base64 PNG/JPEG/GIF/WebP data URLs are saved under the private cache
+//!   and exposed as paths for the narrowly allowed native `read_file`
+//!   tool; unsupported or failed media renders as an omission marker.
 //! * gray tools are NOT passed as native tools. They are described in the
 //!   system text and the `finish` JSON schema's `calls[]` array; `agy`
 //!   calls `finish(answer, calls)` once and gray executes the calls itself.
 //!   `finish` is a REAL native tool call (tool_info fires), so a turn with
 //!   no `finish` call is incomplete — never an answer.
 //! * the child runs under a staged HOME whose
-//!   `~/.gemini/antigravity-cli/settings.json` holds exactly
-//!   `{"toolPermission":"request-review"}`. Verified semantics: headless
+//!   `~/.gemini/antigravity-cli/settings.json` holds
+//!   `{"toolPermission":"request-review"}` and, when the attachment
+//!   directory resolves, allows `read_file(<canonical attachments dir>)`.
+//!   Verified semantics: headless
 //!   mode auto-denies every tool that needs a prompt — `run_command`
-//!   fails with "permission check failed ... user denied", file reads and
-//!   writes are also denied in the staged HOME (the earlier write success
-//!   ran under the user's real HOME with its own allow-rules). Native tools
-//!   can neither execute nor exfiltrate; `finish` stays callable because it
-//!   needs no permission. A skeleton file is required: `agy` ignores an
+//!   fails with "permission check failed ... user denied". The staged
+//!   attachment rule permits `read_file` only there; paths outside it and
+//!   all other native tools remain denied. `finish` stays callable because
+//!   it needs no permission. A skeleton file is required: `agy` ignores an
 //!   absent settings.json and falls back to defaults. One staged HOME now
 //!   serves the whole conversation — staging happens once per session,
 //!   not per turn.
@@ -37,9 +43,13 @@
 //! per-turn bearer.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::Arc;
 
+use base64::Engine;
+use base64::engine::general_purpose::STANDARD;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::setup;
 
@@ -91,17 +101,98 @@ fn check_tool_name(name: &str, seen: &HashSet<String>) -> Result<(), String> {
     Ok(())
 }
 
-fn text_of(blocks: &Value) -> String {
+const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_IMAGE_BASE64: usize = MAX_IMAGE_BYTES.div_ceil(3) * 4;
+
+#[derive(Default)]
+struct RenderFlags {
+    saved_image: bool,
+    omitted_media: bool,
+    attachments_dir: Option<PathBuf>,
+}
+
+/// Decode supported inline images into the private content-addressed cache.
+fn save_image(b: &Value) -> Option<(PathBuf, PathBuf)> {
+    let url = b
+        .get("image_url")
+        .and_then(|v| v.as_str().or_else(|| v.get("url").and_then(Value::as_str)))
+        .or_else(|| b.get("url").and_then(Value::as_str))?;
+    let (header, encoded) = url.strip_prefix("data:")?.split_once(',')?;
+    let (mime, encoding) = header.split_once(';')?;
+    if !encoding.eq_ignore_ascii_case("base64") {
+        return None;
+    }
+    let ext = match mime.to_ascii_lowercase().as_str() {
+        "image/png" => "png",
+        "image/jpeg" => "jpeg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => return None,
+    };
+    if encoded.len() > MAX_IMAGE_BASE64 {
+        return None;
+    }
+    let bytes = STANDARD.decode(encoded).ok()?;
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return None;
+    }
+    let dir = crate::session::attachments_dir().ok()?;
+    let digest = format!("{:x}", Sha256::digest(&bytes));
+    let path = dir.join(format!("{digest}.{ext}"));
+    if !path.exists() {
+        crate::session::write_atomic(&path, &bytes).ok()?;
+    }
+    Some((dir, path))
+}
+
+/// One content part to transcript text. Failed or unsupported media is
+/// explicit so the model knows it never received the attachment.
+fn part_text(b: &Value, flags: &mut RenderFlags) -> Option<String> {
+    match b.get("type").and_then(Value::as_str) {
+        // OpenAI Responses wire parts the host actually sends.
+        Some("text" | "input_text" | "output_text") => {
+            b.get("text").and_then(Value::as_str).map(str::to_string)
+        }
+        Some(other) => {
+            if media_label(other) == Some("image")
+                && let Some((dir, path)) = save_image(b)
+            {
+                flags.saved_image = true;
+                flags.attachments_dir = Some(dir);
+                return Some(format!(
+                    "(image attachment saved at {}: view it with your read_file tool)",
+                    path.display()
+                ));
+            }
+            flags.omitted_media = true;
+            Some(match media_label(other) {
+                Some(label) => {
+                    format!("({label} attachment omitted: this provider relays text only)")
+                }
+                None => format!("({other} part omitted: this provider relays text only)"),
+            })
+        }
+        None => None,
+    }
+}
+
+/// Friendly noun for a media part type, when it is one.
+fn media_label(t: &str) -> Option<&'static str> {
+    Some(match t {
+        "input_image" | "image_url" | "image" => "image",
+        "input_audio" | "audio" => "audio",
+        "input_video" | "video" => "video",
+        "input_file" | "file" => "file",
+        _ => return None,
+    })
+}
+
+fn text_of(blocks: &Value, flags: &mut RenderFlags) -> String {
     match blocks {
         Value::String(s) => s.clone(),
         Value::Array(arr) => arr
             .iter()
-            .filter_map(|b| match b.get("type").and_then(Value::as_str) {
-                Some("text") => b.get("text").and_then(Value::as_str),
-                // OpenAI Responses wire parts the host actually sends.
-                Some("input_text" | "output_text") => b.get("text").and_then(Value::as_str),
-                _ => None,
-            })
+            .filter_map(|part| part_text(part, flags))
             .collect::<Vec<_>>()
             .join(""),
         _ => String::new(),
@@ -123,12 +214,12 @@ fn item_kind(item: &Value) -> &str {
 /// records so the model can reference them; reasoning carriers restore
 /// nothing (agy has no replay) but their text still carries the prior
 /// answer.
-fn render_item(item: &Value) -> Option<String> {
+fn render_item(item: &Value, flags: &mut RenderFlags) -> Option<String> {
     let kind = item_kind(item);
     match kind {
         "message" => {
             let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
-            let text = text_of(item.get("content").unwrap_or(&Value::Null));
+            let text = text_of(item.get("content").unwrap_or(&Value::Null), flags);
             if text.trim().is_empty() {
                 return None;
             }
@@ -142,12 +233,15 @@ fn render_item(item: &Value) -> Option<String> {
         "function_call" => Some(format!("[Assistant]\n{}", calls_block(&[item]))),
         "function_call_output" => {
             let call_id = item.get("call_id").and_then(Value::as_str).unwrap_or("");
+            // Structured output (content-part arrays) renders like message
+            // content — text joined, media marked omitted. Stringifying the
+            // raw JSON would dump base64 blobs into the transcript.
             let out = item
                 .get("output")
-                .map(|v| {
-                    v.as_str()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| v.to_string())
+                .map(|v| match v {
+                    Value::String(s) => s.clone(),
+                    Value::Array(_) => text_of(v, flags),
+                    other => other.to_string(),
                 })
                 .unwrap_or_default();
             Some(format!("[Tool result id={call_id}]\n{out}"))
@@ -200,7 +294,7 @@ fn calls_block(calls: &[&Value]) -> String {
 }
 
 /// Render a Responses `input` array to transcript text.
-fn render_items(items: &[Value]) -> String {
+fn render_items(items: &[Value], flags: &mut RenderFlags) -> String {
     let mut records: Vec<String> = Vec::new();
     let mut open_assistant = false;
     let mut i = 0;
@@ -221,7 +315,7 @@ fn render_items(items: &[Value]) -> String {
                 _ => records.push(format!("[Assistant]\n{block}")),
             }
             open_assistant = false;
-        } else if let Some(r) = render_item(item) {
+        } else if let Some(r) = render_item(item, flags) {
             open_assistant = item_kind(item) == "message"
                 && item.get("role").and_then(Value::as_str) == Some("assistant");
             records.push(r);
@@ -253,6 +347,22 @@ pub(crate) fn finish_schema() -> Value {
         },
         "required": ["answer"],
     })
+}
+
+/// Whether rendering had to omit any media part.
+fn drops_media(flags: &RenderFlags) -> bool {
+    flags.omitted_media
+}
+
+fn image_read_note(dir: &std::path::Path) -> String {
+    format!(
+        "Image attachments appear as file paths under {}. Open each one with your native read_file tool before answering about it; you cannot see it otherwise. Never read other files with native tools.",
+        dir.display()
+    )
+}
+
+fn omitted_media_note() -> &'static str {
+    "Attachments marked \"omitted\" never reached you. This provider relays text and saved image paths only; do not guess about omitted attachments."
 }
 
 /// Translate an OpenAI Responses body into one funnel turn.
@@ -307,7 +417,8 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
                 .into(),
         );
     }
-    let transcript = render_items(&input);
+    let mut render_flags = RenderFlags::default();
+    let transcript = render_items(&input, &mut render_flags);
     if transcript.is_empty() {
         return Err("history must end in a nonempty user/tool-result message".into());
     }
@@ -345,8 +456,8 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     }
     let mut system_parts: Vec<String> = Vec::new();
     system_parts.push(
-        "You are a model provider inside the gray agent harness. You have exactly one tool: finish. \
-        You have NO other tools - never call any native tool for any reason. Gray owns all tools, approvals, and the filesystem. \
+        "You are a model provider inside the gray agent harness. You have exactly one gray tool: finish. \
+        Native tools are forbidden except for read_file on a listed image attachment path, when instructed below. Never read any other path with native tools. Gray owns all tools, approvals, and the filesystem. \
         To use a gray tool, list it in the calls array with its name and args object, and put your reply text in answer. \
         Later messages in this conversation come from gray too: tool results arrive as `[Tool result id=…]` records \
         and new user input as `[User]` records — always answer the latest. \
@@ -362,6 +473,14 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     }
     if !instructions.is_empty() {
         system_parts.push(instructions.to_string());
+    }
+    if render_flags.saved_image
+        && let Some(dir) = render_flags.attachments_dir.as_deref()
+    {
+        system_parts.push(image_read_note(dir));
+    }
+    if drops_media(&render_flags) {
+        system_parts.push(omitted_media_note().to_string());
     }
     let schema = finish_schema();
     Ok(PreparedTurn {
@@ -422,7 +541,13 @@ pub(crate) fn continuation(
                     .unwrap_or("")
                     .to_string(),
             ),
-            "message" => texts.push(text_of(item.get("content").unwrap_or(&Value::Null))),
+            "message" => {
+                let mut ignored_flags = RenderFlags::default();
+                texts.push(text_of(
+                    item.get("content").unwrap_or(&Value::Null),
+                    &mut ignored_flags,
+                ));
+            }
             _ => {}
         }
         i += 1;
@@ -441,9 +566,20 @@ pub(crate) fn continuation(
     if tail.is_empty() || tail.iter().any(assistant_side) {
         return Err("empty_delta");
     }
-    let delta = render_items(tail);
+    let mut render_flags = RenderFlags::default();
+    let mut delta = render_items(tail, &mut render_flags);
     if delta.trim().is_empty() {
         return Err("empty_delta");
+    }
+    if render_flags.saved_image
+        && let Some(dir) = render_flags.attachments_dir.as_deref()
+    {
+        delta.push_str("\n\n[Harness note]\n");
+        delta.push_str(&image_read_note(dir));
+    }
+    if drops_media(&render_flags) {
+        delta.push_str("\n\n[Harness note]\n");
+        delta.push_str(omitted_media_note());
     }
     if undelivered {
         return Ok(format!("{UNDELIVERED_NOTE}\n\n{delta}"));
@@ -486,11 +622,16 @@ impl TurnIsolation {
             &crate::session::conversations_dir(),
             &cli_dir.join("conversations"),
         )?;
-        std::fs::write(
-            cli_dir.join("settings.json"),
-            r#"{"toolPermission":"request-review"}"#,
-        )
-        .map_err(|e| format!("staging settings.json: {e}"))?;
+        let mut settings = json!({"toolPermission": "request-review"});
+        if let Ok(dir) = crate::session::attachments_dir() {
+            settings["permissions"] = json!({
+                "allow": [format!("read_file({})", dir.display())]
+            });
+        }
+        let settings =
+            serde_json::to_vec(&settings).map_err(|e| format!("staging settings.json: {e}"))?;
+        std::fs::write(cli_dir.join("settings.json"), settings)
+            .map_err(|e| format!("staging settings.json: {e}"))?;
         let cwd = std::env::current_dir().map_err(|e| format!("current dir: {e}"))?;
         Ok(Self {
             home,
@@ -804,9 +945,7 @@ pub fn fold_lines(
             Vec::new()
         };
         if salvaged.is_empty() {
-            eprintln!(
-                "antigravity-sub: answer cut at fabricated Tool_call record (offset {at})"
-            );
+            eprintln!("antigravity-sub: answer cut at fabricated Tool_call record (offset {at})");
         } else {
             eprintln!(
                 "antigravity-sub: salvaged {} fabricated Tool_call record(s) (offset {at})",

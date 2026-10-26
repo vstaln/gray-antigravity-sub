@@ -11,6 +11,8 @@
 //!   cache dir and symlinked into every staged HOME (see
 //!   [`crate::chat::TurnIsolation`]), so transcripts outlive both the
 //!   session and the plugin process.
+//! * `attachments/` — content-addressed image files the text-only funnel
+//!   references so `agy` can inspect them with its native `read_file` tool.
 //!
 //! [`crate::live::rewarm`] re-pools records inside the warm window at
 //! startup; [`sweep`] bounds both stores to [`TTL`].
@@ -43,6 +45,13 @@ pub fn conversations_dir() -> PathBuf {
     let dir = cache_root().join("conversations");
     let _ = private_dir(&dir);
     dir
+}
+
+/// Private cache directory for image attachments referenced in turns.
+pub fn attachments_dir() -> std::io::Result<PathBuf> {
+    let dir = cache_root().join("attachments");
+    private_dir(&dir)?;
+    std::fs::canonicalize(dir)
 }
 
 /// A persisted pool entry: the `agy` conversation id (the
@@ -161,7 +170,7 @@ pub fn is_uuid(s: &str) -> bool {
 /// Write `bytes` to `path` atomically (temp file + rename), mode 0600,
 /// creating the parent directory (0700). Concurrent writers never expose
 /// a torn file: readers see the old content or the new, whole.
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().unwrap_or(Path::new("."));
     private_dir(dir)?;
     let tmp = dir.join(format!(
@@ -239,6 +248,11 @@ pub fn sweep(root: &Path, now: SystemTime, ttl: Duration) {
             .and_then(|n| n.split('.').next())
             .is_some_and(is_uuid);
         if is_ours && idle_past(&p, now, ttl) {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+    for p in entries(root.join("attachments")) {
+        if p.symlink_metadata().is_ok_and(|m| m.file_type().is_file()) && idle_past(&p, now, ttl) {
             let _ = std::fs::remove_file(&p);
         }
     }

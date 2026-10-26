@@ -51,23 +51,49 @@ struct Response {
 /// the relay server fills the transcript in when the host POSTs.
 type Relays = relay::Intents;
 
+fn cli_help() -> String {
+    "antigravity-sub — Antigravity subscription provider for gray\n\
+     usage: antigravity-sub manifest | sidecar | status | tools [all|bash|+name|-name|name …]\n\
+     slash:  /antigravity · /antigravity tools …"
+        .to_string()
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> anyhow::Result<()> {
     // `gray install plugin` registers sidecars by running `<bin> manifest`.
-    if std::env::args().nth(1).as_deref() == Some("manifest") {
-        println!("{}", serde_json::to_string(&manifest::manifest())?);
-        return Ok(());
-    }
-    // `gray antigravity-sub tools …` and the REPL's `/antigravity tools …`
-    // land on the same file: one allowlist, no sidecar needed.
-    if std::env::args().nth(1).as_deref() == Some("tools") {
-        let args: Vec<String> = std::env::args().skip(2).collect();
-        println!("{}", antigravity_sub::settings::tools_command(&args));
-        return Ok(());
-    }
-    if std::env::args().nth(1).as_deref() == Some("status") {
-        println!("{}", antigravity_sub::status::text());
-        return Ok(());
+    match std::env::args_os().nth(1).as_deref() {
+        Some(m) if m == "manifest" => {
+            println!("{}", serde_json::to_string(&manifest::manifest())?);
+            return Ok(());
+        }
+        // `gray antigravity-sub tools …` and the REPL's `/antigravity tools …`
+        // land on the same file: one allowlist, no sidecar needed.
+        Some(t) if t == "tools" => {
+            let args: Vec<String> = std::env::args_os()
+                .skip(2)
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            println!("{}", antigravity_sub::settings::tools_command(&args));
+            return Ok(());
+        }
+        Some(s) if s == "status" => {
+            println!("{}", antigravity_sub::status::text());
+            return Ok(());
+        }
+        Some(s) if s == "help" || s == "--help" || s == "-h" => {
+            println!("{}", cli_help());
+            return Ok(());
+        }
+        Some(s) if s == "sidecar" => {}
+        Some(other) => {
+            eprintln!("unknown verb {other:?}\n\n{}", cli_help());
+            std::process::exit(2);
+        }
+        None if std::io::IsTerminal::is_terminal(&std::io::stdin()) => {
+            println!("{}", cli_help());
+            return Ok(());
+        }
+        None => {}
     }
     // Warm the model-discovery cache in the background (`agy models` is a
     // ~seconds network fetch): the first `provider/models` then answers
@@ -175,14 +201,16 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
         )),
         "provider/auth/cancel" => Ok(json!({})),
         "provider/auth/refresh" => {
-            let req: ProviderRefreshRequest =
-                serde_json::from_value(params).map_err(|_| invalid("provider refresh request"))?;
+            let req: ProviderRefreshRequest = serde_json::from_value(params).map_err(|e| {
+                ProviderRpcError::Protocol(format!("bad provider/auth/refresh params: {e}"))
+            })?;
             ensure_provider(&req.provider, &req.auth_method)?;
             Ok(json!({"status": "unsupported"}))
         }
         "provider/auth/revoke" => {
-            let req: ProviderRevokeRequest =
-                serde_json::from_value(params).map_err(|_| invalid("provider revoke request"))?;
+            let req: ProviderRevokeRequest = serde_json::from_value(params).map_err(|e| {
+                ProviderRpcError::Protocol(format!("bad provider/auth/revoke params: {e}"))
+            })?;
             ensure_provider(&req.provider, &req.auth_method)?;
             Ok(json!({"status": "unsupported"}))
         }
@@ -218,10 +246,12 @@ async fn handle(relays: &Relays, request: &Request) -> Result<Value, ProviderRpc
                 })
                 .unwrap_or_default();
             manifest::run_command(name, &argv)
-                .ok_or_else(|| ProviderRpcError::Protocol("unknown command".into()))
+                .ok_or_else(|| ProviderRpcError::Protocol(format!("unknown command: {name}")))
         }
         "plugin/shutdown" => Ok(json!({})),
-        _ => Err(ProviderRpcError::Protocol("unknown provider method".into())),
+        other => Err(ProviderRpcError::Protocol(format!(
+            "method not found: {other}"
+        ))),
     }
 }
 
@@ -300,10 +330,6 @@ fn ensure_provider(provider: &str, auth_method: &str) -> Result<(), ProviderRpcE
             "unknown provider or auth method".into(),
         ))
     }
-}
-
-fn invalid(message: &'static str) -> ProviderRpcError {
-    ProviderRpcError::Protocol(message.into())
 }
 
 fn error_value(error: ProviderRpcError) -> Value {

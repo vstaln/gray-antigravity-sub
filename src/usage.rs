@@ -55,12 +55,10 @@ fn civil(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-
 fn event_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME").map(PathBuf::from)?;
     Some(home.join(".cache/antigravity-sub/quota-event.json"))
 }
-
 
 /// The chat fold saw a quota wall: stamp it for `provider/usage`.
 /// Never carries the prompt — detail is the backend's quota line only.
@@ -85,7 +83,6 @@ fn read_event() -> Option<Value> {
     }
     Some(v)
 }
-
 
 /// `provider/usage` entry: quota-event → honest card. Nothing is fetched
 /// from the network, and the plugin holds no agy credential.
