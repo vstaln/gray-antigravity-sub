@@ -154,15 +154,15 @@ fn part_text(b: &Value, flags: &mut RenderFlags) -> Option<String> {
             b.get("text").and_then(Value::as_str).map(str::to_string)
         }
         Some(other) => {
-            if media_label(other) == Some("image") {
-                if let Some((dir, path)) = save_image(b) {
-                    flags.saved_image = true;
-                    flags.attachments_dir = Some(dir);
-                    return Some(format!(
-                        "(image attachment saved at {}: view it with your read_file tool)",
-                        path.display()
-                    ));
-                }
+            if media_label(other) == Some("image")
+                && let Some((dir, path)) = save_image(b)
+            {
+                flags.saved_image = true;
+                flags.attachments_dir = Some(dir);
+                return Some(format!(
+                    "(image attachment saved at {}: view it with your read_file tool)",
+                    path.display()
+                ));
             }
             flags.omitted_media = true;
             Some(match media_label(other) {
@@ -474,10 +474,10 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     if !instructions.is_empty() {
         system_parts.push(instructions.to_string());
     }
-    if render_flags.saved_image {
-        if let Some(dir) = render_flags.attachments_dir.as_deref() {
-            system_parts.push(image_read_note(dir));
-        }
+    if render_flags.saved_image
+        && let Some(dir) = render_flags.attachments_dir.as_deref()
+    {
+        system_parts.push(image_read_note(dir));
     }
     if drops_media(&render_flags) {
         system_parts.push(omitted_media_note().to_string());
@@ -571,11 +571,11 @@ pub(crate) fn continuation(
     if delta.trim().is_empty() {
         return Err("empty_delta");
     }
-    if render_flags.saved_image {
-        if let Some(dir) = render_flags.attachments_dir.as_deref() {
-            delta.push_str("\n\n[Harness note]\n");
-            delta.push_str(&image_read_note(dir));
-        }
+    if render_flags.saved_image
+        && let Some(dir) = render_flags.attachments_dir.as_deref()
+    {
+        delta.push_str("\n\n[Harness note]\n");
+        delta.push_str(&image_read_note(dir));
     }
     if drops_media(&render_flags) {
         delta.push_str("\n\n[Harness note]\n");
