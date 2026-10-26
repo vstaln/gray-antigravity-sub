@@ -465,10 +465,12 @@ name = "gray-antigravity-sub"
 version = "0.2.2"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "gray-core",
  "gray-plugin",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "tokio",
  "ureq",

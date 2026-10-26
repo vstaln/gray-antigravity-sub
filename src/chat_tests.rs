@@ -4,6 +4,45 @@ fn body(items: Vec<Value>) -> Value {
     json!({"model": "flash", "instructions": "sys", "input": items, "stream": true})
 }
 
+struct IsolatedCache {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    _root: tempfile::TempDir,
+    old_xdg: Option<std::ffi::OsString>,
+    old_home: Option<std::ffi::OsString>,
+}
+
+impl IsolatedCache {
+    fn new() -> Self {
+        let lock = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::tempdir().unwrap();
+        let old_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let old_home = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", root.path().join("xdg"));
+            std::env::set_var("HOME", root.path());
+        }
+        Self {
+            _lock: lock,
+            _root: root,
+            old_xdg,
+            old_home,
+        }
+    }
+}
+
+impl Drop for IsolatedCache {
+    fn drop(&mut self) {
+        match self.old_xdg.take() {
+            Some(value) => unsafe { std::env::set_var("XDG_CACHE_HOME", value) },
+            None => unsafe { std::env::remove_var("XDG_CACHE_HOME") },
+        }
+        match self.old_home.take() {
+            Some(value) => unsafe { std::env::set_var("HOME", value) },
+            None => unsafe { std::env::remove_var("HOME") },
+        }
+    }
+}
+
 #[test]
 fn user_message_becomes_funnel_content() {
     let b = body(vec![json!({"type": "message", "role": "user",
@@ -13,7 +52,7 @@ fn user_message_becomes_funnel_content() {
     assert!(turn.content_line.contains("[User]"));
     assert!(turn.content_line.contains("hi"));
     // System text carries the funnel contract + host instructions.
-    assert!(turn.system.contains("exactly one tool: finish"));
+    assert!(turn.system.contains("exactly one gray tool: finish"));
     assert!(turn.system.contains("sys"));
     // Schema is the {answer, calls[]} envelope.
     assert_eq!(turn.schema["required"], json!(["answer"]));
@@ -315,33 +354,54 @@ fn fold_rejects_double_finish() {
 }
 
 #[test]
-fn image_parts_render_as_omission_markers() {
-    let b = body(vec![json!({"type": "message", "role": "user", "content": [
-        {"type": "input_text", "text": "what is this?"},
-        {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo="},
-    ]})]);
-    let turn = prepare_turn(&b, "flash").unwrap();
-    assert!(turn.content_line.contains("(image attachment omitted"));
-    assert!(turn.content_line.contains("what is this?"));
-    // The marker is a marker: no base64 blob reaches the transcript.
-    assert!(!turn.content_line.contains("iVBORw0KGgo="));
-    assert!(turn.system.contains("relays text only"));
+fn data_url_image_is_saved_and_renders_identically_on_replay() {
+    let _cache = IsolatedCache::new();
+    let encoded = "iVBORw0KGgo=";
+    let bytes = [137, 80, 78, 71, 13, 10, 26, 10];
+    let input = vec![json!({"type": "message", "role": "user", "content": [
+        {"type": "input_image", "image_url": {"url": format!("data:image/png;base64,{encoded}")}},
+    ]})];
+
+    let first = prepare_turn(&body(input.clone()), "flash").unwrap();
+    let dir = crate::session::attachments_dir().unwrap();
+    let path = dir.join(format!("{:x}.png", Sha256::digest(bytes)));
+    let marker = format!(
+        "(image attachment saved at {}: view it with your read_file tool)",
+        path.display()
+    );
+    assert!(first.content_line.contains(&marker));
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+
+    let second = prepare_turn(&body(input), "flash").unwrap();
+    assert_eq!(
+        first.content_line.as_bytes(),
+        second.content_line.as_bytes()
+    );
 }
 
 #[test]
-fn image_only_message_still_reaches_the_model() {
-    // A pure-image turn used to render an empty transcript and die on
-    // "history must end in a nonempty user/tool-result message".
-    let b = body(vec![json!({"type": "message", "role": "user", "content": [
-        {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
-    ]})]);
-    let turn = prepare_turn(&b, "flash").unwrap();
-    assert!(turn.content_line.contains("[User]"));
-    assert!(turn.content_line.contains("(image attachment omitted"));
+fn http_and_invalid_base64_images_are_omitted() {
+    let _cache = IsolatedCache::new();
+    let turn = prepare_turn(
+        &body(vec![json!({"type": "message", "role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "https://example.test/image.png"}},
+            {"type": "input_image", "image_url": "data:image/png;base64,%"},
+        ]})]),
+        "flash",
+    )
+    .unwrap();
+    assert_eq!(
+        turn.content_line
+            .matches("(image attachment omitted")
+            .count(),
+        2
+    );
+    assert!(turn.system.contains("Attachments marked \"omitted\""));
 }
 
 #[test]
 fn array_tool_output_never_dumps_base64() {
+    let _cache = IsolatedCache::new();
     let b = body(vec![
         json!({"type": "function_call_output", "call_id": "c1", "output": [
             {"type": "input_text", "text": "shot taken"},
