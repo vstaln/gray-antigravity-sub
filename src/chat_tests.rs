@@ -230,6 +230,30 @@ fn fold_prefers_full_structured_output_over_clipped_step_echo() {
 }
 
 #[test]
+fn fold_usage_is_this_turns_calls_not_the_conversation_total() {
+    // Captured live: result.usage sums every call in the pooled agy
+    // conversation (12792 + 12898 + 13078 = 38768); the per-call DONE steps
+    // carry the real context size.
+    let lines = vec![
+        json!({"event": "init", "conversation_id": "c1",
+            "init": {"model": "gemini-3.8-flash-low", "tools": ["finish"]}}),
+        json!({"event": "step_update", "step_update": {"conversation_id": "c1",
+            "step_index": 6, "state": "DONE", "step_type": "agent_response",
+            "usage": {"input_tokens": 13000, "output_tokens": 15, "cache_read_tokens": 0}}}),
+        json!({"event": "step_update", "step_update": {"conversation_id": "c1",
+            "step_index": 7, "state": "DONE", "step_type": "agent_response",
+            "usage": {"input_tokens": 13078, "output_tokens": 20, "cache_read_tokens": 0}}}),
+        json!({"event": "result", "result": {"conversation_id": "c1",
+            "status": "SUCCESS", "structured_output": {"answer": "bye"},
+            "usage": {"input_tokens": 38768, "output_tokens": 53}}}),
+    ];
+    let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
+    let (_, _, _, _, usage, _) = fold_lines(&lines, &[], &say).unwrap();
+    assert_eq!(usage.input_tokens, 13078);
+    assert_eq!(usage.output_tokens, 35);
+}
+
+#[test]
 fn fold_rejects_missing_finish() {
     // Text with no finish call is incomplete: without finish there is no
     // answer and no calls.

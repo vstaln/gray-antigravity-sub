@@ -817,6 +817,11 @@ pub fn fold_lines(
         return Err("native request failed (nonzero exit without a success result)".into());
     }
     let mut usage = Usage::default();
+    // Per-call usage from this turn's DONE steps. `result.usage` is a running
+    // total over the whole (pooled, multi-turn) agy conversation, so it is
+    // only the fallback: context size is the LAST call's input, output is the
+    // sum of this turn's calls.
+    let mut step_usage: Option<Usage> = None;
     let mut finish_args: Option<Value> = None;
     // Schema-driven finish: when the model answers as structured output
     // instead of calling the finish tool, agy auto-closes with a bare
@@ -848,6 +853,14 @@ pub fn fold_lines(
             }
             "step_update" => {
                 let su = line.get("step_update");
+                if let Some(u) = su.and_then(|su| su.get("usage")) {
+                    let call = map_usage(u);
+                    let out = step_usage.as_ref().map_or(0, |p| p.output_tokens);
+                    step_usage = Some(Usage {
+                        output_tokens: out + call.output_tokens,
+                        ..call
+                    });
+                }
                 let step_type = su
                     .and_then(|su| su.get("step_type"))
                     .and_then(Value::as_str)
@@ -904,6 +917,9 @@ pub fn fold_lines(
     // `result.structured_output` is the full envelope; the step_update echo
     // is a display copy agy clips to 512 chars + "…" (answer AND calls), so
     // it is only the fallback for builds that never emit structured_output.
+    if let Some(u) = step_usage {
+        usage = u;
+    }
     let args = structured
         .or(finish_args)
         .ok_or_else(|| "incomplete native response: finish was never called".to_string())?;
