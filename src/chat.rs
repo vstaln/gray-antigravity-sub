@@ -901,8 +901,11 @@ pub fn fold_lines(
             _ => {}
         }
     }
-    let args = finish_args
-        .or(structured)
+    // `result.structured_output` is the full envelope; the step_update echo
+    // is a display copy agy clips to 512 chars + "…" (answer AND calls), so
+    // it is only the fallback for builds that never emit structured_output.
+    let args = structured
+        .or(finish_args)
         .ok_or_else(|| "incomplete native response: finish was never called".to_string())?;
     // The schema envelopes the answer; a schema-less `response` string is
     // the fallback (older CLI shape). Either way the answer is required.
