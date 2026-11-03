@@ -43,17 +43,22 @@ fn child_env_strips_gateway_overrides() {
 #[test]
 fn probe_without_token_file_is_logged_out_without_spawning() {
     let _env = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // HOME with no token file: logged out, no child, no browser, no wait.
     let tmp = tempfile::Builder::new()
         .prefix("agy-sub-no-token-")
         .tempdir()
         .unwrap();
     let old_home = std::env::var_os("HOME");
+    let old_dbus = std::env::var_os("DBUS_SESSION_BUS_ADDRESS");
     unsafe { std::env::set_var("HOME", tmp.path()) };
+    unsafe { std::env::remove_var("DBUS_SESSION_BUS_ADDRESS") };
     let got = probe_login();
     match old_home {
         Some(h) => unsafe { std::env::set_var("HOME", h) },
         None => unsafe { std::env::remove_var("HOME") },
+    }
+    match old_dbus {
+        Some(d) => unsafe { std::env::set_var("DBUS_SESSION_BUS_ADDRESS", d) },
+        None => unsafe { std::env::remove_var("DBUS_SESSION_BUS_ADDRESS") },
     }
     assert_eq!(got, LoginState::LoggedOut);
 }
@@ -61,11 +66,8 @@ fn probe_without_token_file_is_logged_out_without_spawning() {
 #[test]
 fn probe_with_real_login_reports_logged_in() {
     let _env = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    // Real user HOME (has the token file): the staged-HOME probe must see
-    // the login — this is the regression test for the empty-HOME probe that
-    // always reported logged-out and popped a Firefox OAuth page.
-    if crate::chat::credential_file().is_none() {
-        eprintln!("SKIP: no agy token file in this environment");
+    if !crate::chat::has_auth_store() {
+        eprintln!("SKIP: no agy auth store in this environment");
         return;
     }
     unsafe { std::env::set_var("AGY_SUB_PROBE_TIMEOUT_SECS", "30") };

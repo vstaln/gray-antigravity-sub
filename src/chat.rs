@@ -606,18 +606,25 @@ impl TurnIsolation {
     /// token link + skeleton authenticates and answers. Fails closed when
     /// the token file is absent.
     pub fn stage() -> Result<Self, String> {
+        if !has_auth_store() {
+            return Err(setup::LOGIN_HINT.to_string());
+        }
         let stage = tempfile::Builder::new()
             .prefix("antigravity-sub-")
             .tempdir()
             .map_err(|e| format!("staging dir: {e}"))?;
         let home = stage.path().to_path_buf();
-        let token_src = credential_file().ok_or_else(|| setup::LOGIN_HINT.to_string())?;
         let cli_dir = home.join(".gemini").join("antigravity-cli");
         std::fs::create_dir_all(&cli_dir).map_err(|e| format!("staging dir: {e}"))?;
-        stage_link(&token_src, &cli_dir.join("antigravity-oauth-token"))?;
-        // `--conversation <sid>` resolves through this dir: symlinked into
-        // every staged HOME, transcripts outlive the session and the
-        // plugin process — what re-warming a record needs.
+        if let Some(token_src) = credential_file() {
+            stage_link(&token_src, &cli_dir.join("antigravity-oauth-token"))?;
+        }
+        if let Some(bin_src) = std::env::var_os("HOME")
+            .map(|h| std::path::Path::new(&h).join(".gemini/antigravity-cli/bin"))
+            .filter(|p| p.is_dir())
+        {
+            let _ = stage_link(&bin_src, &cli_dir.join("bin"));
+        }
         stage_link(
             &crate::session::conversations_dir(),
             &cli_dir.join("conversations"),
@@ -668,6 +675,12 @@ pub fn credential_file() -> Option<std::path::PathBuf> {
         .join("antigravity-cli")
         .join("antigravity-oauth-token");
     file.is_file().then_some(file)
+}
+
+pub fn has_auth_store() -> bool {
+    credential_file().is_some()
+        || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty())
+        || cfg!(target_os = "macos")
 }
 
 fn json_value_prefix(s: &str) -> Option<(Value, usize)> {

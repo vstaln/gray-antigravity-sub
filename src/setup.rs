@@ -151,15 +151,9 @@ pub enum LoginState {
 /// remembered for the sidecar's lifetime; `LoggedOut`/`Unknown` are never
 /// cached so a fresh login is picked up on the next probe.
 pub fn probe_login() -> LoginState {
-    // No token file: logged out without spawning (and without any browser).
-    // The probe never reads token bytes; it only checks the file exists,
-    // then lets the user's own CLI answer through the staged symlink.
-    let token_src = match crate::chat::credential_file() {
-        Some(path) => path,
-        None => return LoginState::LoggedOut,
-    };
-    // A remembered login is checked only after the token file: a removed
-    // token must read as logged out, not as the cached answer.
+    if !crate::chat::has_auth_store() {
+        return LoginState::LoggedOut;
+    }
     static LOGGED_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if LOGGED_IN.load(std::sync::atomic::Ordering::Relaxed) {
         return LoginState::LoggedIn;
@@ -177,15 +171,21 @@ pub fn probe_login() -> LoginState {
     if std::fs::create_dir_all(&cli_dir).is_err() {
         return LoginState::Unknown;
     }
-    // Stage the token symlink (auth without ever reading token bytes) plus
-    // the skeleton settings.json `agy` needs instead of its defaults.
     #[cfg(unix)]
-    if std::os::unix::fs::symlink(&token_src, cli_dir.join("antigravity-oauth-token")).is_err() {
+    if let Some(token_src) = crate::chat::credential_file()
+        && std::os::unix::fs::symlink(&token_src, cli_dir.join("antigravity-oauth-token")).is_err()
+    {
         return LoginState::Unknown;
+    }
+    #[cfg(unix)]
+    if let Some(bin_src) = std::env::var_os("HOME")
+        .map(|h| std::path::Path::new(&h).join(".gemini/antigravity-cli/bin"))
+        .filter(|p| p.is_dir())
+    {
+        let _ = std::os::unix::fs::symlink(&bin_src, cli_dir.join("bin"));
     }
     #[cfg(not(unix))]
     {
-        let _ = &token_src;
         return LoginState::Unknown;
     }
     if std::fs::write(
@@ -199,23 +199,27 @@ pub fn probe_login() -> LoginState {
     let timeout_secs: u64 = std::env::var("AGY_SUB_PROBE_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(30);
+        .unwrap_or(15);
     let mut child = match std::process::Command::new(&binary)
-        .args(["--model", "gemini-3.8-flash-low", "-p", "hi"])
+        .args([
+            "--model",
+            "gemini-3.8-flash-low",
+            "--disable-slash-commands",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "-p",
+            "",
+        ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .envs(child_env())
-        // Staged HOME: token symlink (auth) + skeleton settings.json.
-        // Cwd stays the spawner's so the prompt-cache prefix is stable.
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("XDG_CACHE_HOME", home.join(".cache"))
-        // Neutralize the browser so a stale/expired login can never open
-        // Firefox from a background probe: `agy` calls `xdg-open` directly
-        // (ignores `BROWSER`), but `xdg-open` with no display and
-        // `BROWSER=/bin/true` exits without touching Firefox.
         .env("BROWSER", "/bin/true")
         .env("DISPLAY", "")
         .env("WAYLAND_DISPLAY", "")
@@ -225,11 +229,10 @@ pub fn probe_login() -> LoginState {
         Err(_) => return LoginState::Unknown,
     };
     let status = wait_timeout(&mut child, std::time::Duration::from_secs(timeout_secs));
-    // Never leave a hung OAuth wait behind.
     if status.is_none() {
         let _ = child.kill();
         let _ = child.wait();
-        return LoginState::Unknown;
+        return LoginState::LoggedOut;
     }
     let state = match status {
         Some(Ok(s)) if s.success() => LoginState::LoggedIn,
