@@ -840,6 +840,7 @@ pub fn fold_lines(
     // instead of calling the finish tool, agy auto-closes with a bare
     // "finish" step and the envelope lands in result.structured_output.
     let mut structured: Option<Value> = None;
+    let mut finish_step = false;
     let mut conversation: Option<String> = None;
     for line in lines {
         // Native envelope key is "event" (flat fakes may use "type").
@@ -878,6 +879,9 @@ pub fn fold_lines(
                     .and_then(|su| su.get("step_type"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
+                if step_type == "finish" {
+                    finish_step = true;
+                }
                 if step_type != "tool" {
                     continue;
                 }
@@ -933,9 +937,15 @@ pub fn fold_lines(
     if let Some(u) = step_usage {
         usage = u;
     }
-    let args = structured
-        .or(finish_args)
-        .ok_or_else(|| "incomplete native response: finish was never called".to_string())?;
+    let fired = finish_step || finish_args.is_some();
+    let args = match (fired, structured) {
+        (true, structured) => structured.or(finish_args),
+        (false, Some(_)) => {
+            return Err("incomplete native response: finish was not called this turn; the conversation's earlier structured_output is stale".into());
+        }
+        (false, None) => None,
+    }
+    .ok_or_else(|| "incomplete native response: finish was never called".to_string())?;
     // The schema envelopes the answer; a schema-less `response` string is
     // the fallback (older CLI shape). Either way the answer is required.
     let answer = args

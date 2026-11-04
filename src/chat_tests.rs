@@ -243,6 +243,8 @@ fn fold_usage_is_this_turns_calls_not_the_conversation_total() {
         json!({"event": "step_update", "step_update": {"conversation_id": "c1",
             "step_index": 7, "state": "DONE", "step_type": "agent_response",
             "usage": {"input_tokens": 13078, "output_tokens": 20, "cache_read_tokens": 0}}}),
+        json!({"event": "step_update", "step_update": {"conversation_id": "c1",
+            "step_index": 8, "state": "DONE", "step_type": "finish"}}),
         json!({"event": "result", "result": {"conversation_id": "c1",
             "status": "SUCCESS", "structured_output": {"answer": "bye"},
             "usage": {"input_tokens": 38768, "output_tokens": 53}}}),
