@@ -40,6 +40,9 @@ fn child_env_strips_gateway_overrides() {
     assert!(!env.iter().any(|(k, _)| k == "GOOGLE_GEMINI_BASE_URL"));
 }
 
+// macOS counts the keyring as an auth store unconditionally, so a
+// HOME/DBUS scrub can never simulate "logged out" there.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn probe_without_token_file_is_logged_out_without_spawning() {
     let _env = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -66,7 +69,12 @@ fn probe_without_token_file_is_logged_out_without_spawning() {
 #[test]
 fn probe_with_real_login_reports_logged_in() {
     let _env = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    if !crate::chat::has_auth_store() {
+    // has_auth_store() is always true on macOS (keyring), which says
+    // nothing about whether a probe here can succeed — require a store
+    // the test environment can actually present.
+    let probeable = crate::chat::credential_file().is_some()
+        || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty());
+    if !probeable {
         eprintln!("SKIP: no agy auth store in this environment");
         return;
     }
