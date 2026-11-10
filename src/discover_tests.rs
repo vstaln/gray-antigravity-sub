@@ -113,6 +113,8 @@ fn missing_or_empty_models_file_is_no_override() {
     assert_eq!(got, None);
 }
 
+// The stub is a shell script; Windows cannot exec it.
+#[cfg(unix)]
 #[test]
 fn fetch_parses_stub_binary_output() {
     let _env = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
