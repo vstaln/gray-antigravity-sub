@@ -151,6 +151,12 @@ pub enum LoginState {
 /// remembered for the sidecar's lifetime; `LoggedOut`/`Unknown` are never
 /// cached so a fresh login is picked up on the next probe.
 pub fn probe_login() -> LoginState {
+    // No token file and no keyring: logged out without spawning (and
+    // without any browser). The probe never reads token bytes; it only
+    // checks the file exists, then lets the user's own CLI answer through
+    // the staged symlink. A remembered login is checked only after the
+    // auth store: a removed credential must read as logged out, not as
+    // the cached answer.
     if !crate::chat::has_auth_store() {
         return LoginState::LoggedOut;
     }
