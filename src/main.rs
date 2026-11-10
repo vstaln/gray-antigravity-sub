@@ -283,7 +283,7 @@ async fn chat_turn(relays: &Relays, params: Value) -> Result<Value, ProviderRpcE
     }
     // No token file means no login: `/connect` shows the hint instead of a
     // turn that dies later. (The full probe runs a model call; too slow here.)
-    if antigravity_sub::chat::credential_file().is_none() {
+    if !antigravity_sub::chat::has_auth_store() {
         return Err(ProviderRpcError::Unavailable(setup::LOGIN_HINT.into()));
     }
     let bearer = format!("antigravity-sub-{}", hex_id());

@@ -606,18 +606,25 @@ impl TurnIsolation {
     /// token link + skeleton authenticates and answers. Fails closed when
     /// the token file is absent.
     pub fn stage() -> Result<Self, String> {
+        if !has_auth_store() {
+            return Err(setup::LOGIN_HINT.to_string());
+        }
         let stage = tempfile::Builder::new()
             .prefix("antigravity-sub-")
             .tempdir()
             .map_err(|e| format!("staging dir: {e}"))?;
         let home = stage.path().to_path_buf();
-        let token_src = credential_file().ok_or_else(|| setup::LOGIN_HINT.to_string())?;
         let cli_dir = home.join(".gemini").join("antigravity-cli");
         std::fs::create_dir_all(&cli_dir).map_err(|e| format!("staging dir: {e}"))?;
-        stage_link(&token_src, &cli_dir.join("antigravity-oauth-token"))?;
-        // `--conversation <sid>` resolves through this dir: symlinked into
-        // every staged HOME, transcripts outlive the session and the
-        // plugin process — what re-warming a record needs.
+        if let Some(token_src) = credential_file() {
+            stage_link(&token_src, &cli_dir.join("antigravity-oauth-token"))?;
+        }
+        if let Some(bin_src) = std::env::var_os("HOME")
+            .map(|h| std::path::Path::new(&h).join(".gemini/antigravity-cli/bin"))
+            .filter(|p| p.is_dir())
+        {
+            let _ = stage_link(&bin_src, &cli_dir.join("bin"));
+        }
         stage_link(
             &crate::session::conversations_dir(),
             &cli_dir.join("conversations"),
@@ -668,6 +675,12 @@ pub fn credential_file() -> Option<std::path::PathBuf> {
         .join("antigravity-cli")
         .join("antigravity-oauth-token");
     file.is_file().then_some(file)
+}
+
+pub fn has_auth_store() -> bool {
+    credential_file().is_some()
+        || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty())
+        || cfg!(target_os = "macos")
 }
 
 fn json_value_prefix(s: &str) -> Option<(Value, usize)> {
@@ -817,11 +830,17 @@ pub fn fold_lines(
         return Err("native request failed (nonzero exit without a success result)".into());
     }
     let mut usage = Usage::default();
+    // Per-call usage from this turn's DONE steps. `result.usage` is a running
+    // total over the whole (pooled, multi-turn) agy conversation, so it is
+    // only the fallback: context size is the LAST call's input, output is the
+    // sum of this turn's calls.
+    let mut step_usage: Option<Usage> = None;
     let mut finish_args: Option<Value> = None;
     // Schema-driven finish: when the model answers as structured output
     // instead of calling the finish tool, agy auto-closes with a bare
     // "finish" step and the envelope lands in result.structured_output.
     let mut structured: Option<Value> = None;
+    let mut finish_step = false;
     let mut conversation: Option<String> = None;
     for line in lines {
         // Native envelope key is "event" (flat fakes may use "type").
@@ -848,10 +867,21 @@ pub fn fold_lines(
             }
             "step_update" => {
                 let su = line.get("step_update");
+                if let Some(u) = su.and_then(|su| su.get("usage")) {
+                    let call = map_usage(u);
+                    let out = step_usage.as_ref().map_or(0, |p| p.output_tokens);
+                    step_usage = Some(Usage {
+                        output_tokens: out + call.output_tokens,
+                        ..call
+                    });
+                }
                 let step_type = su
                     .and_then(|su| su.get("step_type"))
                     .and_then(Value::as_str)
                     .unwrap_or("");
+                if step_type == "finish" {
+                    finish_step = true;
+                }
                 if step_type != "tool" {
                     continue;
                 }
@@ -901,9 +931,21 @@ pub fn fold_lines(
             _ => {}
         }
     }
-    let args = finish_args
-        .or(structured)
-        .ok_or_else(|| "incomplete native response: finish was never called".to_string())?;
+    // `result.structured_output` is the full envelope; the step_update echo
+    // is a display copy agy clips to 512 chars + "…" (answer AND calls), so
+    // it is only the fallback for builds that never emit structured_output.
+    if let Some(u) = step_usage {
+        usage = u;
+    }
+    let fired = finish_step || finish_args.is_some();
+    let args = match (fired, structured) {
+        (true, structured) => structured.or(finish_args),
+        (false, Some(_)) => {
+            return Err("incomplete native response: finish was not called this turn; the conversation's earlier structured_output is stale".into());
+        }
+        (false, None) => None,
+    }
+    .ok_or_else(|| "incomplete native response: finish was never called".to_string())?;
     // The schema envelopes the answer; a schema-less `response` string is
     // the fallback (older CLI shape). Either way the answer is required.
     let answer = args
