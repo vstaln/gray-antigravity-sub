@@ -998,7 +998,7 @@ pub fn fold_lines(
     }
     let answer = crate::guard::strip_reasoning(&guarded).trim().to_string();
     let has_calls = !wanted.is_empty();
-    if answer.is_empty() && !(has_calls && (cut.is_some() || salvage.is_some())) {
+    if answer.is_empty() && !has_calls {
         return Err("incomplete native response: finish carried no answer".into());
     }
     say(format!("…{answer}"));
