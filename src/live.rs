@@ -382,23 +382,40 @@ fn unlist_warming(arc: &Arc<Mutex<LiveSession>>) {
     POOL_CHANGED.notify_all();
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Keepalive {
+    Gone,
+    Latched,
+    Unsettled,
+    Fresh,
+    Idle,
+    Due,
+}
+
 /// Keepalive predicate, field-level so tests can drive it without a live
 /// child: the session settled ≥1 real contact, its upstream clock is
 /// stale past `KEEPALIVE_AFTER`, the user is still active enough for a
 /// warm cache to pay off, refresh isn't latched off, and the child is
 /// alive (dead children are the reaper's job, not the sweep's).
-fn keepalive_due(
+fn keepalive_state(
     last_contact: Option<Instant>,
     last_used: Instant,
     disabled: bool,
     dead: bool,
     alive: bool,
-) -> bool {
-    alive
-        && !dead
-        && !disabled
-        && last_contact.is_some_and(|t| t.elapsed() > KEEPALIVE_AFTER)
-        && last_used.elapsed() <= KEEPALIVE_IDLE_MAX
+) -> Keepalive {
+    if !alive || dead {
+        return Keepalive::Gone;
+    }
+    if disabled {
+        return Keepalive::Latched;
+    }
+    match last_contact {
+        None => Keepalive::Unsettled,
+        Some(t) if t.elapsed() <= KEEPALIVE_AFTER => Keepalive::Fresh,
+        Some(_) if last_used.elapsed() > KEEPALIVE_IDLE_MAX => Keepalive::Idle,
+        Some(_) => Keepalive::Due,
+    }
 }
 
 /// Remove the first keepalive-due session from the pool. Out of the pool
@@ -414,13 +431,20 @@ fn take_keepalive() -> Option<Arc<Mutex<LiveSession>>> {
         .map(|arc| {
             arc.try_lock().ok().map(|mut s| {
                 (
-                    keepalive_due(
+                    match keepalive_state(
                         s.last_contact,
                         s.last_used,
                         s.keepalive_disabled,
                         s.dead,
                         matches!(s.child.try_wait(), Ok(None)),
-                    ),
+                    ) {
+                        Keepalive::Due => true,
+                        Keepalive::Gone
+                        | Keepalive::Latched
+                        | Keepalive::Unsettled
+                        | Keepalive::Fresh
+                        | Keepalive::Idle => false,
+                    },
                     s.dead,
                     s.last_used,
                     s.native_model.clone(),
@@ -962,7 +986,7 @@ pub fn run_turn(
     if let Some((arc, delta)) = claimed {
         let chars = delta.chars().count();
         let mut s = lock(&arc);
-        match s.send_content(&delta) {
+        match s.send_content(&chat::fit_prompt("", &delta)) {
             Ok(()) => {
                 let rewarmed = s.rewarmed;
                 let out = settle(&mut s, &turn, &say, deadline);
@@ -993,11 +1017,7 @@ pub fn run_turn(
         }
     }
     let mode = format!("fresh:{reason}");
-    let content = if turn.system.is_empty() {
-        turn.content_line.clone()
-    } else {
-        format!("{}\n\n{}", turn.system, turn.content_line)
-    };
+    let content = chat::fit_prompt(&turn.system, &turn.content_line);
     let chars = content.chars().count();
     let arc = match spawn(&turn, None) {
         Ok(arc) => arc,

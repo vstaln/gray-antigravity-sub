@@ -1,19 +1,16 @@
-//! `provider/usage`: Antigravity subscription quota, as far as gray can see
-//! it without reading agy's credentials or calling any internal API.
+//! `provider/usage`: Antigravity subscription quota.
 //!
-//! - **`quota-event` write-through**: when the chat fold sees a quota wall in
-//!   the official `agy` CLI's output, it stamps this plugin's own state file
-//!   (`~/.cache/antigravity-sub/quota-event.json`). That renders as a 100%
-//!   row until the event is six hours old.
-//! - Otherwise the card reports the provider honestly: connected, with a note
-//!   that gray has no quota feed for this account.
-//!
-//! There is no live quota probe. The old one read agy's OAuth token from the
-//! OS keyring or token file and called Google's internal Code Assist endpoints
-//! while sending a spoofed `antigravity` User-Agent. Both were removed.
+//! - **Live**: the official `agy -p /usage --output-format json` report,
+//!   one window per quota bucket. gray never touches agy's credentials.
+//! - **`quota-event` write-through**: when the live report is unavailable and
+//!   the chat fold saw a quota wall, it renders as a 100% row until the event
+//!   is six hours old.
+//! - Otherwise the card reports the provider as connected with no bars.
 
-use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{Value, json};
 
@@ -64,14 +61,80 @@ fn event_path() -> Option<PathBuf> {
 /// Never carries the prompt — detail is the backend's quota line only.
 pub fn note_quota_event(detail: &str) {
     let Some(path) = event_path() else { return };
-    if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
+    let at = now_secs();
     let body = json!({
         "detail": detail.chars().take(200).collect::<String>(),
-        "at": now_secs(),
+        "at": at,
     });
-    let _ = std::fs::write(path, body.to_string());
+    let _ = locked_update(&path, |current| {
+        let stored = current
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|v| v.get("at").and_then(Value::as_u64));
+        match stored {
+            Some(newer) if newer > at => Update::Keep,
+            Some(_) | None => Update::Replace(body.to_string()),
+        }
+    });
+}
+
+enum Update {
+    Keep,
+    Replace(String),
+}
+
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".");
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+fn locked_update(path: &Path, apply: impl FnOnce(Option<String>) -> Update) -> std::io::Result<()> {
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("quota event path has no parent"))?;
+    std::fs::create_dir_all(dir)?;
+    let lock = private_options()
+        .create(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
+        .open(sidecar(path, "lock"))?;
+    lock.lock()?;
+    let current = match std::fs::read_to_string(path) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    match apply(current) {
+        Update::Keep => {}
+        Update::Replace(text) => write_atomic(path, text.as_bytes())?,
+    }
+    lock.unlock()
+}
+
+fn private_options() -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let tmp = sidecar(path, &format!("tmp-{}", std::process::id()));
+    let mut file = private_options()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
+    std::fs::rename(&tmp, path)?;
+    if let Some(dir) = path.parent() {
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    Ok(())
 }
 
 fn read_event() -> Option<Value> {
@@ -87,6 +150,14 @@ fn read_event() -> Option<Value> {
 /// `provider/usage` entry: quota-event → honest card. Nothing is fetched
 /// from the network, and the plugin holds no agy credential.
 pub fn handle() -> Result<Value, ProviderRpcError> {
+    if let Some(windows) = live_windows() {
+        return Ok(json!({
+            "available": true,
+            "title": "Antigravity",
+            "windows": windows,
+            "checked_at": iso(now_secs()),
+        }));
+    }
     if let Some(event) = read_event() {
         return Ok(json!({
             "available": true,
@@ -104,6 +175,54 @@ pub fn handle() -> Result<Value, ProviderRpcError> {
         "windows": [],
         "checked_at": iso(now_secs()),
         "note": "gray can't read this account's quota; limits appear here after agy reports one",
+    }))
+}
+
+const LIVE_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn live_windows() -> Option<Vec<Value>> {
+    let out = crate::discover::capture(&["-p", "/usage", "--output-format", "json"], LIVE_TIMEOUT)?;
+    parse_live(&serde_json::from_str(&out).ok()?)
+}
+
+pub fn parse_live(doc: &Value) -> Option<Vec<Value>> {
+    let groups = doc.pointer("/command/data/groups")?.as_array()?;
+    let windows: Vec<Value> = groups
+        .iter()
+        .flat_map(|g| {
+            let group = group_short(g["name"].as_str().unwrap_or(""));
+            g["buckets"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(move |b| bucket_window(&group, b))
+        })
+        .collect();
+    (!windows.is_empty()).then_some(windows)
+}
+
+fn group_short(name: &str) -> String {
+    match name {
+        "Gemini Models" => "Gemini".to_string(),
+        "Claude and GPT models" => "Claude/GPT".to_string(),
+        n => n.strip_prefix("Gemini 4 ").unwrap_or(n).to_string(),
+    }
+}
+
+fn bucket_window(group: &str, b: &Value) -> Option<Value> {
+    let remaining = b["remaining_fraction"].as_f64()?;
+    let (span, kind) = match b["window"].as_str() {
+        Some("5h") => ("5h", "session"),
+        Some("weekly") => ("Weekly", "weekly"),
+        Some(other) => (other, "other"),
+        None => ("Quota", "other"),
+    };
+    Some(json!({
+        "id": b["id"].clone(),
+        "label": format!("{span} \u{b7} {group}"),
+        "kind": kind,
+        "used_percent": ((1.0 - remaining) * 100.0).clamp(0.0, 100.0),
+        "resets_at": b["reset_time"].clone(),
     }))
 }
 

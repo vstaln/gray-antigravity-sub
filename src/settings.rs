@@ -110,6 +110,10 @@ fn valid_name(name: &str) -> bool {
 /// picker) takes it.
 pub fn command(argv: &[String]) -> String {
     match argv.first().map(String::as_str) {
+        Some("account") => match crate::accounts::command(&argv[1..]) {
+            Ok(text) => text,
+            Err(e) => e,
+        },
         Some("tools") => tools_command(&argv[1..]),
         _ => format!("{USAGE}\n\n{}", status_line(&ToolPolicy::load())),
     }
@@ -123,6 +127,7 @@ const USAGE: &str = "\
   /antigravity tools bash     bash only (the default)
   /antigravity tools +name    also allow one tool, e.g. /antigravity tools +discord_send
   /antigravity tools -name    remove one
+/antigravity account — the Antigravity login: list · usage (one keyring login; no pool yet).
 Same from a shell: `gray antigravity-sub tools …`.";
 
 fn status_line(policy: &ToolPolicy) -> String {

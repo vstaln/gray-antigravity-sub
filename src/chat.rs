@@ -325,6 +325,46 @@ fn render_items(items: &[Value], flags: &mut RenderFlags) -> String {
     records.join("\n\n")
 }
 
+pub const NATIVE_PROMPT_BUDGET: usize = 180_000;
+
+const SNAP_LIMIT: usize = 8_000;
+
+const RECORD_HEADS: [&str; 4] = [
+    "\n\n[User]\n",
+    "\n\n[Assistant",
+    "\n\n[Tool result id=",
+    "\n\n[System]\n",
+];
+
+pub fn fit_prompt(head: &str, body: &str) -> String {
+    fit_prompt_to(head, body, NATIVE_PROMPT_BUDGET)
+}
+
+pub(crate) fn fit_prompt_to(head: &str, body: &str, budget: usize) -> String {
+    let sep = if head.is_empty() { "" } else { "\n\n" };
+    if head.len() + sep.len() + body.len() <= budget {
+        return format!("{head}{sep}{body}");
+    }
+    let room = budget
+        .saturating_sub(head.len() + sep.len() + 120)
+        .max(budget / 4)
+        .min(body.len());
+    let mut start = body.len() - room;
+    while !body.is_char_boundary(start) {
+        start += 1;
+    }
+    let cut = RECORD_HEADS
+        .iter()
+        .filter_map(|h| body[start..].find(h))
+        .min()
+        .filter(|k| *k <= SNAP_LIMIT)
+        .map_or(start, |k| start + k + 2);
+    format!(
+        "{head}{sep}[Earlier conversation omitted: {cut} bytes did not fit the native prompt limit]\n\n{}",
+        &body[cut..]
+    )
+}
+
 /// The `finish` envelope every turn's `--json-schema` pins: a constant,
 /// so a child spawned idle for a re-warmed session ([`crate::live::rewarm`])
 /// carries the same one its next turn expects.
@@ -998,7 +1038,7 @@ pub fn fold_lines(
     }
     let answer = crate::guard::strip_reasoning(&guarded).trim().to_string();
     let has_calls = !wanted.is_empty();
-    if answer.is_empty() && !(has_calls && (cut.is_some() || salvage.is_some())) {
+    if answer.is_empty() && !has_calls {
         return Err("incomplete native response: finish carried no answer".into());
     }
     say(format!("…{answer}"));
