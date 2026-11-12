@@ -157,9 +157,15 @@ fn file_override() -> Option<Vec<DiscoveredModel>> {
 /// see their own routes. The browser is neutralized anyway so a CLI that
 /// ever decided to authenticate could not pop a window mid-fetch.
 fn fetch(timeout: Duration) -> Option<Vec<DiscoveredModel>> {
+    let out = capture(&["models"], timeout)?;
+    let parsed = parse_tsv(&out);
+    (!parsed.is_empty()).then_some(parsed)
+}
+
+pub fn capture(args: &[&str], timeout: Duration) -> Option<String> {
     let binary = crate::setup::resolve_command()?;
     let mut child = Command::new(binary)
-        .arg("models")
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -206,8 +212,7 @@ fn fetch(timeout: Duration) -> Option<Vec<DiscoveredModel>> {
     if !ok {
         return None;
     }
-    let parsed = parse_tsv(&String::from_utf8_lossy(&buf));
-    (!parsed.is_empty()).then_some(parsed)
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// `agy models` stdout → rows. Tolerant: blank lines and non-row noise
