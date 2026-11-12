@@ -9,7 +9,6 @@
 
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -95,12 +94,11 @@ fn locked_update(path: &Path, apply: impl FnOnce(Option<String>) -> Update) -> s
         .parent()
         .ok_or_else(|| std::io::Error::other("quota event path has no parent"))?;
     std::fs::create_dir_all(dir)?;
-    let lock = OpenOptions::new()
+    let lock = private_options()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
-        .mode(0o600)
         .open(sidecar(path, "lock"))?;
     lock.lock()?;
     let current = match std::fs::read_to_string(path) {
@@ -115,13 +113,19 @@ fn locked_update(path: &Path, apply: impl FnOnce(Option<String>) -> Update) -> s
     lock.unlock()
 }
 
+fn private_options() -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
+    opts
+}
+
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = sidecar(path, &format!("tmp-{}", std::process::id()));
-    let mut file = OpenOptions::new()
+    let mut file = private_options()
         .create(true)
         .write(true)
         .truncate(true)
-        .mode(0o600)
         .open(&tmp)?;
     file.write_all(bytes)?;
     file.sync_all()?;
