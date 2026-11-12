@@ -20,7 +20,7 @@
 //! - `plugin/shutdown` → clean exit. Unknown methods are protocol errors
 //!   (provider sidecars must fail loudly, never hang a turn).
 
-use antigravity_sub::{catalog, live, manifest, models, relay, setup, usage};
+use antigravity_sub::{accounts, catalog, live, manifest, models, relay, setup, usage};
 
 use gray_plugin::{ProviderRefreshRequest, ProviderRevokeRequest, ProviderRpcError};
 use serde::{Deserialize, Serialize};
@@ -53,8 +53,8 @@ type Relays = relay::Intents;
 
 fn cli_help() -> String {
     "antigravity-sub — Antigravity subscription provider for gray\n\
-     usage: antigravity-sub manifest | sidecar | status | tools [all|bash|+name|-name|name …]\n\
-     slash:  /antigravity · /antigravity tools …"
+     usage: antigravity-sub manifest | sidecar | status | tools [all|bash|+name|-name|name …] | account <verb>\n\
+     slash:  /antigravity · /antigravity tools … · /antigravity account …"
         .to_string()
 }
 
@@ -75,6 +75,22 @@ async fn main() -> anyhow::Result<()> {
                 .collect();
             println!("{}", antigravity_sub::settings::tools_command(&args));
             return Ok(());
+        }
+        Some(a) if a == "account" => {
+            let args: Vec<String> = std::env::args_os()
+                .skip(2)
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            match accounts::command(&args) {
+                Ok(text) => {
+                    println!("{text}");
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    std::process::exit(2);
+                }
+            }
         }
         Some(s) if s == "status" => {
             println!("{}", antigravity_sub::status::text());
