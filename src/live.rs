@@ -986,7 +986,7 @@ pub fn run_turn(
     if let Some((arc, delta)) = claimed {
         let chars = delta.chars().count();
         let mut s = lock(&arc);
-        match s.send_content(&delta) {
+        match s.send_content(&chat::fit_prompt("", &delta)) {
             Ok(()) => {
                 let rewarmed = s.rewarmed;
                 let out = settle(&mut s, &turn, &say, deadline);
@@ -1017,11 +1017,7 @@ pub fn run_turn(
         }
     }
     let mode = format!("fresh:{reason}");
-    let content = if turn.system.is_empty() {
-        turn.content_line.clone()
-    } else {
-        format!("{}\n\n{}", turn.system, turn.content_line)
-    };
+    let content = chat::fit_prompt(&turn.system, &turn.content_line);
     let chars = content.chars().count();
     let arc = match spawn(&turn, None) {
         Ok(arc) => arc,
