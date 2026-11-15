@@ -76,6 +76,10 @@ fn aliases() -> &'static [(&'static str, &'static str, &'static str)] {
 /// and a bare base resolves to its first routable member.
 pub(crate) const TIERS: &[&str] = &["low", "medium", "high"];
 
+const BARE_TAIL: &[&str] = &["low", "medium", "high", "xhigh"];
+
+const DEFAULT_TIER: &str = "medium";
+
 /// One decision point's view of routable ids: the live list when
 /// `agy models` answered, else `None` and the pinned table governs.
 /// Taking it once per decision keeps a catalog or a turn consistent even
@@ -168,7 +172,12 @@ impl Snapshot {
     }
 }
 
+fn without_provider(model: &str) -> &str {
+    model.rsplit_once('/').map_or(model, |(_, id)| id)
+}
+
 fn canonical_in(snap: &Snapshot, model: &str) -> String {
+    let model = without_provider(model);
     if let Some(id) = snap.resolve_alias(model) {
         return id;
     }
@@ -207,6 +216,16 @@ pub fn native_model(model: &str) -> String {
     canonical_in(&Snapshot::current(), model)
 }
 
+fn tiered_in(snap: &Snapshot, base: &str, effort: Option<&str>) -> String {
+    effort
+        .into_iter()
+        .chain(std::iter::once(DEFAULT_TIER))
+        .chain(TIERS.iter().copied())
+        .map(|tier| format!("{base}-{tier}"))
+        .find(|candidate| snap.is_routable(candidate))
+        .unwrap_or_else(|| format!("{base}-{DEFAULT_TIER}"))
+}
+
 /// Effort-aware route: the host's `/thinking` pick (`reasoning.effort`)
 /// swaps the resolved id's effort tier — but only onto another routable
 /// id (the live list when discovery answered, else the pinned table).
@@ -223,7 +242,14 @@ pub(crate) fn native_model_for_effort_in(
     model: &str,
     effort: Option<&str>,
 ) -> String {
-    let canon = canonical_in(snap, model);
+    let bare = without_provider(model);
+    if !BARE_TAIL.iter().any(|t| bare.ends_with(&format!("-{t}")))
+        && !snap.is_routable(bare)
+        && snap.resolve_alias(bare).is_none()
+    {
+        return tiered_in(snap, bare, effort);
+    }
+    let canon = canonical_in(snap, bare);
     let Some(effort) = effort else { return canon };
     for tier in TIERS {
         let suffix = format!("-{tier}");
