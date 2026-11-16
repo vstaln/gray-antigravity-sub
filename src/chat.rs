@@ -327,8 +327,6 @@ fn render_items(items: &[Value], flags: &mut RenderFlags) -> String {
 
 pub const NATIVE_PROMPT_BUDGET: usize = 180_000;
 
-const SNAP_LIMIT: usize = 8_000;
-
 const RECORD_HEADS: [&str; 4] = [
     "\n\n[User]\n",
     "\n\n[Assistant",
@@ -349,20 +347,48 @@ pub(crate) fn fit_prompt_to(head: &str, body: &str, budget: usize) -> String {
         .saturating_sub(head.len() + sep.len() + 120)
         .max(budget / 4)
         .min(body.len());
-    let mut start = body.len() - room;
-    while !body.is_char_boundary(start) {
-        start += 1;
+    let records = split_records(body);
+    let first = records.first().copied().unwrap_or_default();
+    let mut kept: Vec<&str> = Vec::new();
+    let mut used = first.len();
+    for r in records.iter().skip(1).rev() {
+        if used + r.len() + 2 > room {
+            break;
+        }
+        used += r.len() + 2;
+        kept.push(r);
     }
-    let cut = RECORD_HEADS
-        .iter()
-        .filter_map(|h| body[start..].find(h))
-        .min()
-        .filter(|k| *k <= SNAP_LIMIT)
-        .map_or(start, |k| start + k + 2);
+    kept.reverse();
+    let omitted = body.len().saturating_sub(used);
     format!(
-        "{head}{sep}[Earlier conversation omitted: {cut} bytes did not fit the native prompt limit]\n\n{}",
-        &body[cut..]
+        "{head}{sep}{first}\n\n[{omitted} bytes of earlier tool output omitted to fit the native prompt limit; the task above and the newest records below are intact]\n\n{}",
+        kept.join("\n\n")
     )
+}
+
+fn split_records(body: &str) -> Vec<&str> {
+    let mut starts: Vec<usize> = Vec::new();
+    for h in RECORD_HEADS {
+        let mut from = 0;
+        while let Some(k) = body[from..].find(h) {
+            starts.push(from + k + 2);
+            from += k + h.len();
+        }
+    }
+    starts.sort_unstable();
+    starts.dedup();
+    if starts.first().copied() != Some(0) {
+        starts.insert(0, 0);
+    }
+    let mut out: Vec<&str> = Vec::new();
+    for (i, start) in starts.iter().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(body.len());
+        let rec = body[*start..end].trim_end_matches('\n');
+        if !rec.is_empty() {
+            out.push(rec);
+        }
+    }
+    out
 }
 
 /// The `finish` envelope every turn's `--json-schema` pins: a constant,

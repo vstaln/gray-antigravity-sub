@@ -462,3 +462,19 @@ fn array_tool_output_never_dumps_base64() {
     assert!(turn.content_line.contains("shot taken"));
     assert!(!turn.content_line.contains("QUJD"));
 }
+
+#[test]
+fn overflow_keeps_the_first_record_and_the_newest_ones() {
+    let first = "[User]\nORIGINAL TASK: build the thing";
+    let body = format!(
+        "{first}{}",
+        (1..=40)
+            .map(|i| format!("\n\n[Tool result id=t{i}]\n{}", "x".repeat(400)))
+            .collect::<String>()
+    );
+    let out = super::fit_prompt_to("sys", &body, 4_000);
+    assert!(out.contains("ORIGINAL TASK"), "first record must survive");
+    assert!(out.contains("t40"), "newest record must survive");
+    assert!(!out.contains("t1]"), "middle records are elided");
+    assert!(out.contains("bytes of earlier tool output omitted"));
+}
