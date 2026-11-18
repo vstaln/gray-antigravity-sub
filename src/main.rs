@@ -53,7 +53,7 @@ type Relays = relay::Intents;
 
 fn cli_help() -> String {
     "antigravity-sub — Antigravity subscription provider for gray\n\
-     usage: antigravity-sub manifest | sidecar | status | tools [all|bash|+name|-name|name …] | account <verb>\n\
+     usage: antigravity-sub manifest | sidecar | status | tools [all|default|bash|+name|-name|name …] | account <verb>\n\
      slash:  /antigravity · /antigravity tools … · /antigravity account …"
         .to_string()
 }

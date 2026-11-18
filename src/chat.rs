@@ -1074,17 +1074,25 @@ pub fn fold_lines(
     // echoed history ambiguous (and collide in the host transcript).
     let call_tag = rand_hex(8);
     for (i, want) in wanted.iter().enumerate() {
-        let tool = want.get("tool").and_then(Value::as_str).unwrap_or("");
-        if !names.contains(&tool.to_string()) {
-            return Err(format!(
-                "native requested a tool outside the current host inventory: {tool:?}"
-            ));
-        }
+        let raw_tool = want.get("tool").and_then(Value::as_str).unwrap_or("");
+        // A tool outside the advertised `names` list must never fail the
+        // turn (which triggers host retries + cold replays) or silently
+        // execute a policy-filtered host tool: rewrite to `native__…` so
+        // the host answers "Tool '...' does not exist." as a normal tool
+        // result on the still-warm session.
+        let tool = if names.iter().any(|n| n == raw_tool) {
+            raw_tool.to_string()
+        } else {
+            eprintln!(
+                "antigravity-sub: native requested {raw_tool:?}, outside the host inventory; forwarding as native__"
+            );
+            native_name(raw_tool)
+        };
         let call_args = want.get("args").cloned().unwrap_or(json!({}));
         // Deterministic within the fold; unique across the session.
         let id = format!("call_{call_tag}_{}", i + 1);
         let args_str = serde_json::to_string(&call_args).unwrap_or_else(|_| "{}".into());
-        calls.push((id, tool.to_string(), args_str));
+        calls.push((id, tool, args_str));
     }
     let stop = if calls.is_empty() {
         "completed".to_string()
@@ -1151,6 +1159,25 @@ pub fn fold_lines(
     );
     sse.extend_from_slice(b"data: [DONE]\n\n");
     Ok((sse, natives, answer, calls, usage, stop))
+}
+
+/// `native__`-prefixed form of a tool name outside the advertised host
+/// inventory — sanitized, capped at 50 chars, and unable to collide with
+/// a real tool, so the host answers "does not exist" instead of crashing
+/// the turn.
+fn native_name(raw: &str) -> String {
+    let mut name = String::from("native__");
+    for c in raw.chars() {
+        if name.len() >= 50 {
+            break;
+        }
+        name.push(if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+            c
+        } else {
+            '_'
+        });
+    }
+    name
 }
 
 pub(crate) fn conversation_of(line: &Value) -> String {

@@ -41,8 +41,8 @@
 //! on every pool access and by a background sweep; [`shutdown_all`]
 //! closes everything on `plugin/shutdown` or host-stdin EOF.
 //!
-//! Keepalive: Gemini's implicit prompt cache outlives a turn by only
-//! ~minutes, so pooled sessions idle past `KEEPALIVE_AFTER` get one fixed
+//! Keepalive: Gemini's implicit prompt cache behind `agy` outlives a turn
+//! by only 45-60s, so pooled sessions idle past `KEEPALIVE_AFTER` get one fixed
 //! ping line on stdin — a real turn upstream (every stdin line is), worded
 //! so the model reads it as automated. The tradeoff vs the old
 //! re-spawn-replay keepalive: the ping lands in the child's transcript —
@@ -50,8 +50,11 @@
 //! (`absorbed` + the reply echo) which the ping never touches. A failed
 //! ping latches `keepalive_disabled` (fail closed: an erroring session
 //! must not refresh on a loop); the next real turn re-arms it. Warming
-//! stops once user idleness passes `KEEPALIVE_IDLE_MAX` — set to
-//! `IDLE_TTL`, so a session stays warm for its whole reusable life.
+//! stops once user idleness passes `KEEPALIVE_IDLE_MAX` (about three
+//! pings), and only sessions whose last real turn in this process
+//! carried tools and at least `KEEPALIVE_MIN_TOKENS` of context are
+//! warmed — one-shot requests (session titles), small contexts and
+//! re-warmed records cost more to ping than to resend.
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
@@ -74,17 +77,15 @@ const IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 const REAPER_SWEEP: Duration = Duration::from_secs(60);
 /// How often the keepalive sweep checks pooled sessions for stale
 /// upstream contact.
-const KEEPALIVE_SWEEP: Duration = Duration::from_secs(30);
+const KEEPALIVE_SWEEP: Duration = Duration::from_secs(5);
 /// Fire a keepalive once the session's last settled upstream contact is
 /// this old — comfortably under the implicit prompt-cache TTL, so the
 /// next continuation still hits a warm prefix.
-const KEEPALIVE_AFTER: Duration = Duration::from_secs(4 * 60);
-/// Keep warming for as long as a pooled session can still answer a turn:
-/// stopping earlier leaves a live session whose ~minutes cache has
-/// already lapsed, so a turn landing in the gap re-bills the whole
-/// transcript on a session that looks warm. `IDLE_TTL` reaps it either
-/// way.
-const KEEPALIVE_IDLE_MAX: Duration = IDLE_TTL;
+const KEEPALIVE_AFTER: Duration = Duration::from_secs(25);
+/// Stop warming once the user has been idle this long: past ~3 pings the
+/// pings cost more than the one cold resend they would prevent.
+const KEEPALIVE_IDLE_MAX: Duration = Duration::from_secs(120);
+const KEEPALIVE_MIN_TOKENS: usize = 80_000;
 /// A turn waits this long for a matching session to come back from a
 /// keepalive before spawning fresh instead.
 const KEEPALIVE_WAIT: Duration = Duration::from_secs(60);
@@ -153,6 +154,7 @@ pub struct LiveSession {
     keepalive_turns: u32,
     /// Fail-closed latch on a failed ping; the next real turn re-arms it.
     keepalive_disabled: bool,
+    pingable: bool,
     /// Wire went dead or we killed the child: never re-pool.
     dead: bool,
     /// Re-pooled from a persisted record after a plugin restart — its
@@ -432,7 +434,7 @@ fn take_keepalive() -> Option<Arc<Mutex<LiveSession>>> {
             arc.try_lock().ok().map(|mut s| {
                 (
                     match keepalive_state(
-                        s.last_contact,
+                        s.pingable.then_some(s.last_contact).flatten(),
                         s.last_used,
                         s.keepalive_disabled,
                         s.dead,
@@ -618,6 +620,7 @@ fn spawn(turn: &PreparedTurn, resume: Option<&str>) -> Result<Arc<Mutex<LiveSess
         last_used: Instant::now(),
         last_contact: None,
         keepalive_turns: 0,
+        pingable: false,
         keepalive_disabled: false,
         dead: false,
         rewarmed: false,
@@ -858,6 +861,7 @@ impl LiveSession {
         self.last_used = now;
         self.last_contact = Some(now);
         self.keepalive_disabled = false;
+        self.pingable = false;
     }
 
     /// Record a settled ping: bumps only the upstream-contact clock and
@@ -1063,8 +1067,9 @@ fn settle(
         }
     };
     match chat::fold_lines(&lines, &turn.names, say) {
-        Ok((sse, _, text, calls, _, _)) => {
+        Ok((sse, _, text, calls, usage, _)) => {
             s.absorb(turn, &text, &calls);
+            s.pingable = !turn.names.is_empty() && usage.input_tokens >= KEEPALIVE_MIN_TOKENS;
             record(s);
             Ok(sse)
         }

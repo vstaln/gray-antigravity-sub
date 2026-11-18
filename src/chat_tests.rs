@@ -165,22 +165,31 @@ fn fold_maps_finish_calls_to_host_names() {
 }
 
 #[test]
-fn fold_rejects_foreign_tools() {
+fn fold_rewrites_foreign_tools_to_native_prefix() {
     let lines = vec![
         json!({"event": "init", "conversation_id": "c1",
             "init": {"model": "gemini-3.8-flash-low", "tools": ["finish"]}}),
         json!({"event": "step_update", "step_update": {"conversation_id": "c1",
-            "step_index": 1, "state": "DONE", "step_type": "tool",
-            "tool_name": "finish",
-            "tool_info": {"name": "finish",
-                "parameters": {"answer": "done",
-                    "calls": [{"tool": "rm_rf", "args": {}}]}}}}),
+        "step_index": 1, "state": "DONE", "step_type": "tool",
+        "tool_name": "finish",
+        "tool_info": {"name": "finish",
+            "parameters": {"answer": "done",
+                "calls": [
+                    {"tool": "rm_rf", "args": {}},
+                    {"tool": "weird tool/name!", "args": {}},
+                    {"tool": "", "args": {}},
+                ]}}}}),
         json!({"event": "result", "result": {"conversation_id": "c1",
             "status": "SUCCESS", "response": "done",
             "usage": {"input_tokens": 1, "output_tokens": 1}}}),
     ];
     let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
-    assert!(fold_lines(&lines, &["bash".to_string()], &say).is_err());
+    let (_, _, _, calls, _, stop) = fold_lines(&lines, &["bash".to_string()], &say).unwrap();
+    assert_eq!(stop, "tool_use");
+    assert_eq!(calls.len(), 3);
+    assert_eq!(calls[0].1, "native__rm_rf");
+    assert_eq!(calls[1].1, "native__weird_tool_name_");
+    assert_eq!(calls[2].1, "native__");
 }
 
 #[test]
