@@ -177,6 +177,7 @@ pub fn capture_in(args: &[&str], timeout: Duration, home: Option<&Path>) -> Opti
         .envs(home.map_or_else(crate::setup::child_env, |h| {
             let mut env = crate::setup::child_env();
             env.push(("HOME".to_string(), h.display().to_string()));
+            env.extend(crate::setup::account_env(h));
             env
         }))
         // Insurance against an auth flow: `agy` calls `xdg-open`

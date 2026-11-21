@@ -87,6 +87,17 @@ pub fn conflicting_env() -> Option<String> {
 
 /// Child env for every spawn: never inherit a conflicting value, always
 /// quiet the CLI's nonessential traffic.
+pub fn keyring_off(home: &std::path::Path) -> (String, String) {
+    (
+        "DBUS_SESSION_BUS_ADDRESS".to_string(),
+        format!("unix:path={}", home.join("no-bus").display()),
+    )
+}
+
+pub fn account_env(home: &std::path::Path) -> Option<(String, String)> {
+    crate::accounts::token_of(home).map(|_| keyring_off(home))
+}
+
 pub fn child_env() -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = std::env::vars()
         .filter(|(k, _)| {
@@ -223,6 +234,7 @@ pub fn probe_login() -> LoginState {
         .stderr(std::process::Stdio::null())
         .envs(child_env())
         .env("HOME", &home)
+        .envs(account_env(&home))
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("XDG_CACHE_HOME", home.join(".cache"))

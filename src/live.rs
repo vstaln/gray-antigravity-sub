@@ -348,6 +348,7 @@ fn spawn(
         // (toolPermission request-review). Cwd stays the real one so the
         // prompt-cache prefix is stable across turns.
         .env("HOME", &isolation.home)
+        .envs(setup::account_env(&isolation.home))
         .env("XDG_CONFIG_HOME", isolation.home.join(".config"))
         .env("XDG_DATA_HOME", isolation.home.join(".local/share"))
         .env("XDG_CACHE_HOME", isolation.home.join(".cache"))

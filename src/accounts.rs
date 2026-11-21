@@ -552,6 +552,7 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
         .args(["-p", "/usage"])
         .envs(setup::child_env())
         .env("HOME", &dest)
+        .envs([setup::keyring_off(&dest)])
         .env("BROWSER", "/bin/true")
         .env("DISPLAY", "")
         .env("WAYLAND_DISPLAY", "")
