@@ -243,7 +243,10 @@ pub fn parse_tsv(out: &str) -> Vec<DiscoveredModel> {
         };
         if id.is_empty()
             || id.chars().any(char::is_whitespace)
-            || !id.bytes().any(|b| b.is_ascii_digit())
+            || !id.contains('-')
+            || !id.bytes().all(|b| {
+                b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-' || b == b'_' || b == b'.'
+            })
         {
             continue;
         }

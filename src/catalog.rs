@@ -74,7 +74,7 @@ fn aliases() -> &'static [(&'static str, &'static str, &'static str)] {
 /// The effort tiers `agy` bakes into ids, in the catalog's preference
 /// order: `resolve_alias` degrades a family through the same sequence,
 /// and a bare base resolves to its first routable member.
-pub(crate) const TIERS: &[&str] = &["low", "medium", "high"];
+pub(crate) const TIERS: &[&str] = &["low", "medium", "high", "xhigh"];
 
 const BARE_TAIL: &[&str] = &["low", "medium", "high", "xhigh"];
 
