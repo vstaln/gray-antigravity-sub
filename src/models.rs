@@ -12,7 +12,7 @@
 
 use std::collections::BTreeMap;
 
-use gray_plugin::{ModelVariant, ProviderModel, ProviderModelCatalog};
+use gray_plugin::{ModelSlot, ModelVariant, ProviderModel, ProviderModelCatalog, SlotOption};
 
 use crate::catalog;
 use crate::catalog::TIERS;
@@ -66,16 +66,61 @@ pub(crate) fn catalog_in(snap: &catalog::Snapshot) -> ProviderModelCatalog {
         if !snap.is_routable(&id) {
             continue;
         }
-        let Some((base, tier)) = split_tier(&id) else {
-            let reasoning_efforts = if id.starts_with("gemini-pro-orchestrator-") {
-                TIERS.iter().map(|t| (*t).to_string()).collect()
-            } else {
-                Vec::new()
+        if id.starts_with("gemini-pro-orchestrator-") {
+            let opt_id = id
+                .strip_prefix("gemini-pro-orchestrator-")
+                .unwrap_or(&id)
+                .to_string();
+            let opt_name = match opt_id.as_str() {
+                "neon" => "Gemini 4 Neon".to_string(),
+                "g1-pro" | "argon" => "Gemini 4 Argon".to_string(),
+                other => catalog::title_case(other),
             };
+            let idx = models
+                .iter()
+                .position(|m| m.id == "orchestrator")
+                .unwrap_or_else(|| {
+                    models.push(ProviderModel {
+                        id: "orchestrator".to_string(),
+                        name: "Orchestrator (Antigravity)".to_string(),
+                        context_window: catalog::context_window_in(snap, &id),
+                        reasoning_efforts: TIERS.iter().map(|t| (*t).to_string()).collect(),
+                        variants: vec![],
+                        slots: vec![ModelSlot {
+                            key: "planner".to_string(),
+                            label: "Planner".to_string(),
+                            options: vec![],
+                        }],
+                        price_cliff_tokens: None,
+                    });
+                    models.len() - 1
+                });
+            let row = &mut models[idx];
+            if let Some(slot) = row.slots.first_mut()
+                && !slot.options.iter().any(|o| o.id == opt_id)
+            {
+                slot.options.push(SlotOption {
+                    id: opt_id.clone(),
+                    name: opt_name,
+                });
+            }
+            for tier in TIERS {
+                let mut parts = std::collections::BTreeMap::new();
+                parts.insert("planner".to_string(), opt_id.clone());
+                row.variants.push(ModelVariant {
+                    id: id.clone(),
+                    effort: Some((*tier).to_string()),
+                    fast: false,
+                    parts,
+                });
+            }
+            continue;
+        }
+        let Some((base, tier)) = split_tier(&id) else {
             models.push(ProviderModel {
                 name: catalog::display_name_in(snap, &id),
                 context_window: catalog::context_window_in(snap, &id),
-                reasoning_efforts,
+                reasoning_efforts: Vec::new(),
                 id,
                 variants: vec![],
                 slots: vec![],
