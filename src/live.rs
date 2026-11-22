@@ -408,6 +408,7 @@ fn spawn_idle(rec: &session::Record) -> Option<Arc<Mutex<LiveSession>>> {
         schema: chat::finish_schema(),
         names: Vec::new(),
         native_model: rec.model.clone(),
+        effort: None,
     };
     let account = (!rec.home.is_empty()).then(|| Path::new(&rec.home));
     let arc = spawn(&turn, Some(&rec.sid), account).ok()?;

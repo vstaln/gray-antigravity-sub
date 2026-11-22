@@ -67,10 +67,15 @@ pub(crate) fn catalog_in(snap: &catalog::Snapshot) -> ProviderModelCatalog {
             continue;
         }
         let Some((base, tier)) = split_tier(&id) else {
+            let reasoning_efforts = if id.starts_with("gemini-pro-orchestrator-") {
+                TIERS.iter().map(|t| (*t).to_string()).collect()
+            } else {
+                Vec::new()
+            };
             models.push(ProviderModel {
                 name: catalog::display_name_in(snap, &id),
                 context_window: catalog::context_window_in(snap, &id),
-                reasoning_efforts: Vec::new(),
+                reasoning_efforts,
                 id,
                 variants: vec![],
                 slots: vec![],

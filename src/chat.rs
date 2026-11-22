@@ -65,6 +65,7 @@ pub struct PreparedTurn {
     pub schema: Value,
     pub names: Vec<String>,
     pub native_model: String,
+    pub effort: Option<String>,
 }
 
 /// Normalize a tool input schema: strip top-level `oneOf`/`allOf`/`anyOf`
@@ -555,7 +556,25 @@ pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
         input,
         schema,
         names,
-        native_model: crate::catalog::native_model(model),
+        native_model: {
+            let m = crate::catalog::native_model(model);
+            m
+        },
+        effort: {
+            let native = crate::catalog::native_model(model);
+            let tiered = crate::catalog::TIERS
+                .iter()
+                .any(|t| native.ends_with(&format!("-{t}")));
+            if tiered {
+                None
+            } else {
+                body.get("reasoning")
+                    .and_then(|r| r.get("effort"))
+                    .and_then(Value::as_str)
+                    .map(|e| e.trim().to_ascii_lowercase())
+                    .filter(|e| matches!(e.as_str(), "low" | "medium" | "high" | "xhigh" | "max"))
+            }
+        },
     })
 }
 
