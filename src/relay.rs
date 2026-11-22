@@ -73,7 +73,7 @@ fn handle_conn(
     bearer: &str,
     used: &Arc<AtomicBool>,
 ) {
-    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(330)));
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(630)));
     let mut buf = vec![0u8; 65536];
     let mut head = Vec::new();
     loop {
@@ -246,7 +246,7 @@ fn run_turn(
         &body,
         &intent.model,
         effort,
-        std::time::Duration::from_secs(300),
+        std::time::Duration::from_secs(600),
         isolated,
         intent.account.as_ref(),
     )

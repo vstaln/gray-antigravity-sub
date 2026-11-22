@@ -149,7 +149,10 @@ fn ensure_default(store: &mut Store) {
     }
     let email = std::env::var_os("HOME").and_then(|h| identity_of(Path::new(&h)));
     if let Some(e) = &email
-        && store.accounts.iter().any(|a| a.email.as_deref() == Some(e.as_str()))
+        && store
+            .accounts
+            .iter()
+            .any(|a| a.email.as_deref() == Some(e.as_str()))
     {
         return;
     }
@@ -854,7 +857,12 @@ fn usage_targets(store: &Store, want: Option<&str>) -> Result<Targets, String> {
         .accounts
         .iter()
         .filter(|a| want.is_none_or(|w| a.label == w))
-        .map(|a| (Some(a.label.clone()), spawn_home(&a.home).map(Path::to_path_buf)))
+        .map(|a| {
+            (
+                Some(a.label.clone()),
+                spawn_home(&a.home).map(Path::to_path_buf),
+            )
+        })
         .collect();
     match want {
         Some(w) if picked.is_empty() => Err(format!("no account labelled {w:?}")),

@@ -432,6 +432,16 @@ fn omitted_media_note() -> &'static str {
     "Attachments marked \"omitted\" never reached you. This provider relays text and saved image paths only; do not guess about omitted attachments."
 }
 
+pub fn system_base(mut sys: &str) -> &str {
+    if let Some(prefix) = sys.strip_suffix(omitted_media_note()) {
+        sys = prefix.trim_end_matches('\n');
+    }
+    if let Some(idx) = sys.rfind("\n\nImage attachments appear as file paths under ") {
+        sys = &sys[..idx];
+    }
+    sys
+}
+
 /// Translate an OpenAI Responses body into one funnel turn.
 pub fn prepare_turn(body: &Value, model: &str) -> Result<PreparedTurn, String> {
     let instructions = body

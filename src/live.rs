@@ -56,7 +56,7 @@ use crate::chat::{self, PreparedTurn, TurnIsolation, Usage};
 use crate::{session, setup};
 
 /// Pool bound: at most this many idle `agy` children.
-const MAX_LIVE: usize = 4;
+const MAX_LIVE: usize = 8;
 /// A pooled session idle this long (no real turn) is closed.
 const IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 /// Reaper sweep period.
@@ -208,7 +208,7 @@ fn find(
             ("account", 0)
         } else if s.native_model != turn.native_model {
             ("model", 1)
-        } else if s.system != turn.system {
+        } else if chat::system_base(&s.system) != chat::system_base(&turn.system) {
             ("system", 2)
         } else {
             match chat::continuation(&s.absorbed, &s.reply_call_ids, &s.reply_text, &turn.input) {
@@ -589,8 +589,9 @@ impl LiveSession {
     /// Read this turn's lines until its `result` — the per-turn terminal
     /// line. The channel gives the deadline teeth: a silent child (quota
     /// backoff, a stuck retry) can't park the turn forever.
-    fn drain(&mut self, deadline: Instant) -> Result<Vec<Value>, String> {
+    fn drain(&mut self, timeout: Duration) -> Result<Vec<Value>, String> {
         let mut lines = Vec::new();
+        let mut deadline = Instant::now() + timeout;
         loop {
             let msg = if let Some(m) = self.pending.pop_front() {
                 m
@@ -600,7 +601,10 @@ impl LiveSession {
                     return Err("Antigravity request timed out".into());
                 }
                 match self.rx.recv_timeout(left) {
-                    Ok(m) => m,
+                    Ok(m) => {
+                        deadline = Instant::now() + timeout;
+                        m
+                    }
                     Err(RecvTimeoutError::Timeout) => {
                         return Err("Antigravity request timed out".into());
                     }
@@ -735,12 +739,11 @@ fn run_turn_on(
     isolated: bool,
     account: Option<&Path>,
 ) -> Result<Vec<u8>, String> {
-    let deadline = Instant::now() + timeout;
     let mut turn = chat::prepare_turn(body, model)?;
     turn.native_model = crate::catalog::native_model_for_effort(model, effort);
     let say: Arc<dyn Fn(String) + Send + Sync> = Arc::new(|_| {});
     if isolated {
-        return run_isolated(&turn, &say, deadline, account);
+        return run_isolated(&turn, &say, timeout, account);
     }
     let (claimed, mut reason) = take(&turn, account);
     if let Some((arc, delta)) = claimed {
@@ -749,7 +752,7 @@ fn run_turn_on(
         match s.send_content(&chat::fit_prompt("", &delta)) {
             Ok(()) => {
                 let rewarmed = s.rewarmed;
-                let out = settle(&mut s, &turn, &say, deadline);
+                let out = settle(&mut s, &turn, &say, timeout);
                 trace_result("reuse", &s, chars, &out);
                 let died = s.dead;
                 drop(s);
@@ -794,7 +797,7 @@ fn run_turn_on(
         s.close();
         return Err(e);
     }
-    let out = settle(&mut s, &turn, &say, deadline);
+    let out = settle(&mut s, &turn, &say, timeout);
     trace_result(&mode, &s, chars, &out);
     let poolable = !s.dead;
     drop(s);
@@ -807,7 +810,7 @@ fn run_turn_on(
 fn run_isolated(
     turn: &PreparedTurn,
     say: &Arc<dyn Fn(String) + Send + Sync>,
-    deadline: Instant,
+    timeout: Duration,
     account: Option<&Path>,
 ) -> Result<Vec<u8>, String> {
     let content = chat::fit_prompt(&turn.system, &turn.content_line);
@@ -817,7 +820,7 @@ fn run_isolated(
     let mut s = lock(&arc);
     let out = match s.send_content(&content) {
         Ok(()) => s
-            .drain(deadline)
+            .drain(timeout)
             .and_then(|lines| chat::fold_lines(&lines, &turn.names, say).map(|f| f.0)),
         Err(e) => Err(e),
     };
@@ -835,9 +838,9 @@ fn settle(
     s: &mut LiveSession,
     turn: &PreparedTurn,
     say: &Arc<dyn Fn(String) + Send + Sync>,
-    deadline: Instant,
+    timeout: Duration,
 ) -> Result<Vec<u8>, String> {
-    let lines = match s.drain(deadline) {
+    let lines = match s.drain(timeout) {
         Ok(lines) => lines,
         Err(e) => {
             s.close();
