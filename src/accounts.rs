@@ -129,29 +129,73 @@ fn load() -> Store {
     load_checked().unwrap_or_default()
 }
 
+fn spawn_home(home: &Path) -> Option<&Path> {
+    (!home.as_os_str().is_empty()).then_some(home)
+}
+
+fn ensure_default(store: &mut Store) {
+    if store
+        .accounts
+        .iter()
+        .any(|a| a.home.as_os_str().is_empty() || a.label == "default")
+    {
+        return;
+    }
+    let has_ambient = crate::chat::credential_file().is_some()
+        || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty())
+        || cfg!(target_os = "macos");
+    if !has_ambient {
+        return;
+    }
+    let email = std::env::var_os("HOME").and_then(|h| identity_of(Path::new(&h)));
+    if let Some(e) = &email
+        && store.accounts.iter().any(|a| a.email.as_deref() == Some(e.as_str()))
+    {
+        return;
+    }
+    store.accounts.insert(
+        0,
+        Account {
+            label: "default".to_string(),
+            home: PathBuf::new(),
+            email,
+            org: None,
+            added_at: 0,
+            health: Health::Ready,
+            request_count: 0,
+            last_used_at: 0,
+        },
+    );
+}
+
 fn load_checked() -> Result<Store, String> {
     let Some(path) = file_path() else {
-        return Ok(Store::default());
+        let mut s = Store::default();
+        ensure_default(&mut s);
+        return Ok(s);
     };
-    match std::fs::read_to_string(&path) {
-        Ok(text) if text.trim().is_empty() => Ok(Store::default()),
-        Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Store::default()),
-        Err(e) => Err(format!("{}: {e}", path.display())),
-    }
+    let mut store: Store = match std::fs::read_to_string(&path) {
+        Ok(text) if text.trim().is_empty() => Store::default(),
+        Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Store::default(),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    ensure_default(&mut store);
+    Ok(store)
 }
 
 fn mutate<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
     let path = file_path().ok_or("cannot resolve GRAY_HOME")?;
     let _lock =
         crate::session::lock_file(&path).map_err(|e| format!("lock {}: {e}", path.display()))?;
-    let mut store = match std::fs::read_to_string(&path) {
+    let mut store: Store = match std::fs::read_to_string(&path) {
         Ok(text) if text.trim().is_empty() => Store::default(),
         Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Store::default(),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
     let before = serde_json::to_string(&store).map_err(|e| e.to_string())?;
+    ensure_default(&mut store);
     let out = f(&mut store)?;
     if serde_json::to_string(&store).map_err(|e| e.to_string())? != before {
         let text = serde_json::to_string_pretty(&store).map_err(|e| e.to_string())?;
@@ -220,7 +264,7 @@ fn transition(
 fn pick_of(a: &Account) -> Pick {
     Pick {
         label: a.label.clone(),
-        home: Some(a.home.clone()),
+        home: spawn_home(&a.home).map(Path::to_path_buf),
     }
 }
 
@@ -548,17 +592,43 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
         let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o700));
     }
     eprintln!("signing {label:?} in under {} …", dest.display());
-    let placed = std::process::Command::new(&binary)
-        .args(["-p", "/usage"])
+    let real_home = std::env::var("HOME").unwrap_or_default();
+    let shim = dest.join("xdg-open");
+    if !real_home.is_empty() {
+        let script = format!(
+            "#!/bin/sh\nHOME='{}' exec /usr/bin/xdg-open \"$@\" >/dev/null 2>&1 &\n",
+            real_home.replace('\'', "'\\''")
+        );
+        if std::fs::write(&shim, script).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+    }
+    let path_env = format!(
+        "{}:{}",
+        dest.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(["-p", "/usage"])
         .envs(setup::child_env())
         .env("HOME", &dest)
+        .env("PATH", path_env)
+        .env("BROWSER", &shim)
         .envs([setup::keyring_off(&dest)])
-        .env("BROWSER", "/bin/true")
-        .env("DISPLAY", "")
-        .env("WAYLAND_DISPLAY", "")
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    if std::env::var_os("XAUTHORITY").is_none() && !real_home.is_empty() {
+        let xauth = Path::new(&real_home).join(".Xauthority");
+        if xauth.is_file() {
+            cmd.env("XAUTHORITY", xauth);
+        }
+    }
+    let placed = cmd
         .status()
         .map_err(|e| format!("spawn agy: {e}"))
         .and_then(|s| {
@@ -568,6 +638,7 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
                 Err(format!("agy sign-in failed (exited {s})"))
             }
         });
+    let _ = std::fs::remove_file(&shim);
     if let Err(e) = placed {
         let _ = std::fs::remove_dir_all(&dest);
         return Err(e);
@@ -783,7 +854,7 @@ fn usage_targets(store: &Store, want: Option<&str>) -> Result<Targets, String> {
         .accounts
         .iter()
         .filter(|a| want.is_none_or(|w| a.label == w))
-        .map(|a| (Some(a.label.clone()), Some(a.home.clone())))
+        .map(|a| (Some(a.label.clone()), spawn_home(&a.home).map(Path::to_path_buf)))
         .collect();
     match want {
         Some(w) if picked.is_empty() => Err(format!("no account labelled {w:?}")),
