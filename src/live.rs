@@ -332,9 +332,8 @@ fn spawn(
         }
     };
     let mut wire_model = turn.native_model.as_str();
-    let mut orch_effort: Option<&str> = turn.effort.as_deref();
     let mut orch_settings: Option<String> = None;
-    let parts: Vec<&str> = turn.native_model.split('+').collect();
+    let parts: Vec<&str> = turn.native_model.split("--").collect();
     if parts.len() == 4 && parts[0] == "gemini-pro-orchestrator" {
         let (p_id, e_id, tier) = (parts[1], parts[2], parts[3]);
         wire_model = if p_id == "gemini-4-argon" || p_id == "g1-pro" {
@@ -343,7 +342,6 @@ fn spawn(
             "gemini-pro-orchestrator-neon"
         };
         let eff = turn.effort.as_deref().unwrap_or(tier);
-        orch_effort = Some(eff);
         let p_tier = clamp_tier(p_id, eff);
         let e_tier = clamp_tier(e_id, eff);
         orch_settings = Some(
@@ -351,6 +349,25 @@ fn spawn(
                 "orchestrator": {
                     "planner": format!("{p_id}-{p_tier}"),
                     "executor": format!("{e_id}-{e_tier}"),
+                }
+            })
+            .to_string(),
+        );
+    } else if wire_model.starts_with("gemini-pro-orchestrator-")
+        && let Some(eff) = turn.effort.as_deref()
+    {
+        let p_id = if wire_model.ends_with("g1-pro") || wire_model.ends_with("argon") {
+            "gemini-4-argon"
+        } else {
+            "gemini-4-neon"
+        };
+        let p_tier = clamp_tier(p_id, eff);
+        let e_tier = clamp_tier("gemini-4-hydrogen", eff);
+        orch_settings = Some(
+            json!({
+                "orchestrator": {
+                    "planner": format!("{p_id}-{p_tier}"),
+                    "executor": format!("gemini-4-hydrogen-{e_tier}"),
                 }
             })
             .to_string(),
@@ -367,9 +384,6 @@ fn spawn(
         "--json-schema",
         schema_str.as_str(),
     ];
-    if let Some(eff) = orch_effort.filter(|_| wire_model.starts_with("gemini-pro-orchestrator-")) {
-        args.extend(["--effort", eff]);
-    }
     if let Some(settings) = orch_settings.as_deref() {
         args.extend(["--settings", settings]);
     }

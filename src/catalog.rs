@@ -243,6 +243,9 @@ pub(crate) fn native_model_for_effort_in(
     effort: Option<&str>,
 ) -> String {
     let bare = without_provider(model);
+    if bare.starts_with("gemini-pro-orchestrator--") {
+        return bare.to_string();
+    }
     if !BARE_TAIL.iter().any(|t| bare.ends_with(&format!("-{t}")))
         && !snap.is_routable(bare)
         && snap.resolve_alias(bare).is_none()

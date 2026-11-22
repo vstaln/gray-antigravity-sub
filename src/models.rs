@@ -130,7 +130,7 @@ pub(crate) fn catalog_in(snap: &catalog::Snapshot) -> ProviderModelCatalog {
                             parts.insert("planner".to_string(), p.id.clone());
                             parts.insert("executor".to_string(), e.id.clone());
                             variants.push(ModelVariant {
-                                id: format!("gemini-pro-orchestrator+{}+{}+{tier}", p.id, e.id),
+                                id: format!("gemini-pro-orchestrator--{}--{}--{tier}", p.id, e.id),
                                 effort: Some((*tier).to_string()),
                                 fast: false,
                                 parts,
