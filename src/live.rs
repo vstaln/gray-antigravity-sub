@@ -323,9 +323,42 @@ fn spawn(
     let schema_str =
         serde_json::to_string(&turn.schema).map_err(|e| format!("schema encode: {e}"))?;
     let isolation = TurnIsolation::stage(account)?;
+    let clamp_tier = |family: &str, tier: &str| -> &'static str {
+        match (family, tier) {
+            ("gemini-4-neon" | "gemini-4-hydrogen", "xhigh") => "xhigh",
+            (_, "xhigh" | "high") => "high",
+            (_, "low") => "low",
+            _ => "medium",
+        }
+    };
+    let mut wire_model = turn.native_model.as_str();
+    let mut orch_effort: Option<&str> = turn.effort.as_deref();
+    let mut orch_settings: Option<String> = None;
+    let parts: Vec<&str> = turn.native_model.split('+').collect();
+    if parts.len() == 4 && parts[0] == "gemini-pro-orchestrator" {
+        let (p_id, e_id, tier) = (parts[1], parts[2], parts[3]);
+        wire_model = if p_id == "gemini-4-argon" || p_id == "g1-pro" {
+            "gemini-pro-orchestrator-g1-pro"
+        } else {
+            "gemini-pro-orchestrator-neon"
+        };
+        let eff = turn.effort.as_deref().unwrap_or(tier);
+        orch_effort = Some(eff);
+        let p_tier = clamp_tier(p_id, eff);
+        let e_tier = clamp_tier(e_id, eff);
+        orch_settings = Some(
+            json!({
+                "orchestrator": {
+                    "planner": format!("{p_id}-{p_tier}"),
+                    "executor": format!("{e_id}-{e_tier}"),
+                }
+            })
+            .to_string(),
+        );
+    }
     let mut args: Vec<&str> = vec![
         "--model",
-        turn.native_model.as_str(),
+        wire_model,
         "--disable-slash-commands",
         "--input-format",
         "stream-json",
@@ -334,6 +367,12 @@ fn spawn(
         "--json-schema",
         schema_str.as_str(),
     ];
+    if let Some(eff) = orch_effort.filter(|_| wire_model.starts_with("gemini-pro-orchestrator-")) {
+        args.extend(["--effort", eff]);
+    }
+    if let Some(settings) = orch_settings.as_deref() {
+        args.extend(["--settings", settings]);
+    }
     if let Some(sid) = resume {
         args.extend(["--conversation", sid]);
     }

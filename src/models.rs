@@ -57,7 +57,8 @@ pub fn catalog() -> ProviderModelCatalog {
 pub(crate) fn catalog_in(snap: &catalog::Snapshot) -> ProviderModelCatalog {
     let mut models: Vec<ProviderModel> = Vec::new();
     let mut family_row: BTreeMap<String, usize> = BTreeMap::new();
-    for id in catalog::all_ids_in(snap) {
+    let ids = catalog::all_ids_in(snap);
+    for id in ids.clone() {
         // Only routable ids earn a row. An alias either resolves onto an
         // already-listed member — a second row for the same route with
         // the same display name — or onto a dead pin, an unroutable id
@@ -67,51 +68,95 @@ pub(crate) fn catalog_in(snap: &catalog::Snapshot) -> ProviderModelCatalog {
             continue;
         }
         if id.starts_with("gemini-pro-orchestrator-") {
-            let opt_id = id
-                .strip_prefix("gemini-pro-orchestrator-")
-                .unwrap_or(&id)
-                .to_string();
-            let opt_name = match opt_id.as_str() {
-                "neon" => "Gemini 4 Neon".to_string(),
-                "g1-pro" | "argon" => "Gemini 4 Argon".to_string(),
-                other => catalog::title_case(other),
-            };
-            let idx = models
-                .iter()
-                .position(|m| m.id == "orchestrator")
-                .unwrap_or_else(|| {
-                    models.push(ProviderModel {
-                        id: "orchestrator".to_string(),
-                        name: "Orchestrator (Antigravity)".to_string(),
-                        context_window: catalog::context_window_in(snap, &id),
-                        reasoning_efforts: TIERS.iter().map(|t| (*t).to_string()).collect(),
-                        variants: vec![],
-                        slots: vec![ModelSlot {
+            if !models.iter().any(|m| m.id == "orchestrator") {
+                let has_family = |prefix: &str| {
+                    ids.iter()
+                        .any(|k| k == prefix || k.starts_with(&format!("{prefix}-")))
+                };
+                let mut planners = Vec::new();
+                for (fid, fname) in [
+                    ("gemini-4-neon", "Gemini 4 Neon"),
+                    ("gemini-4-carbon", "Gemini 4 Carbon"),
+                    ("gemini-4-argon", "Gemini 4 Argon"),
+                    ("claude-opus-5-5", "Claude Opus 5.5"),
+                ] {
+                    let orch_match = (fid == "gemini-4-neon"
+                        && ids.iter().any(|k| k == "gemini-pro-orchestrator-neon"))
+                        || (fid == "gemini-4-argon"
+                            && ids.iter().any(|k| {
+                                k == "gemini-pro-orchestrator-g1-pro"
+                                    || k == "gemini-pro-orchestrator-argon"
+                            }));
+                    if has_family(fid) || orch_match {
+                        planners.push(SlotOption {
+                            id: fid.to_string(),
+                            name: fname.to_string(),
+                        });
+                    }
+                }
+                if planners.is_empty() {
+                    planners.push(SlotOption {
+                        id: "gemini-4-neon".to_string(),
+                        name: "Gemini 4 Neon".to_string(),
+                    });
+                }
+                let mut executors = Vec::new();
+                for (fid, fname) in [
+                    ("gemini-4-hydrogen", "Gemini 4 Hydrogen"),
+                    ("claude-sonnet-5-5", "Claude Sonnet 5.5"),
+                ] {
+                    if has_family(fid) {
+                        executors.push(SlotOption {
+                            id: fid.to_string(),
+                            name: fname.to_string(),
+                        });
+                    }
+                }
+                if executors.is_empty() {
+                    executors.push(SlotOption {
+                        id: "gemini-4-hydrogen".to_string(),
+                        name: "Gemini 4 Hydrogen".to_string(),
+                    });
+                    executors.push(SlotOption {
+                        id: "claude-sonnet-5-5".to_string(),
+                        name: "Claude Sonnet 5.5".to_string(),
+                    });
+                }
+                let mut variants = Vec::new();
+                for p in &planners {
+                    for e in &executors {
+                        for tier in TIERS {
+                            let mut parts = std::collections::BTreeMap::new();
+                            parts.insert("planner".to_string(), p.id.clone());
+                            parts.insert("executor".to_string(), e.id.clone());
+                            variants.push(ModelVariant {
+                                id: format!("gemini-pro-orchestrator+{}+{}+{tier}", p.id, e.id),
+                                effort: Some((*tier).to_string()),
+                                fast: false,
+                                parts,
+                            });
+                        }
+                    }
+                }
+                models.push(ProviderModel {
+                    id: "orchestrator".to_string(),
+                    name: "Orchestrator (Antigravity)".to_string(),
+                    context_window: catalog::context_window_in(snap, &id),
+                    reasoning_efforts: TIERS.iter().map(|t| (*t).to_string()).collect(),
+                    variants,
+                    slots: vec![
+                        ModelSlot {
                             key: "planner".to_string(),
                             label: "Planner".to_string(),
-                            options: vec![],
-                        }],
-                        price_cliff_tokens: None,
-                    });
-                    models.len() - 1
-                });
-            let row = &mut models[idx];
-            if let Some(slot) = row.slots.first_mut()
-                && !slot.options.iter().any(|o| o.id == opt_id)
-            {
-                slot.options.push(SlotOption {
-                    id: opt_id.clone(),
-                    name: opt_name,
-                });
-            }
-            for tier in TIERS {
-                let mut parts = std::collections::BTreeMap::new();
-                parts.insert("planner".to_string(), opt_id.clone());
-                row.variants.push(ModelVariant {
-                    id: id.clone(),
-                    effort: Some((*tier).to_string()),
-                    fast: false,
-                    parts,
+                            options: planners,
+                        },
+                        ModelSlot {
+                            key: "executor".to_string(),
+                            label: "Executor".to_string(),
+                            options: executors,
+                        },
+                    ],
+                    price_cliff_tokens: None,
                 });
             }
             continue;
@@ -173,11 +218,15 @@ pub(crate) fn catalog_in(snap: &catalog::Snapshot) -> ProviderModelCatalog {
                 .and_then(|e| TIERS.iter().position(|t| *t == e))
                 .unwrap_or(usize::MAX)
         });
-        row.reasoning_efforts = row
-            .variants
-            .iter()
-            .filter_map(|v| v.effort.clone())
-            .collect();
+        let mut effs = Vec::new();
+        for v in &row.variants {
+            if let Some(e) = &v.effort
+                && !effs.contains(e)
+            {
+                effs.push(e.clone());
+            }
+        }
+        row.reasoning_efforts = effs;
     }
     ProviderModelCatalog { models }
 }
