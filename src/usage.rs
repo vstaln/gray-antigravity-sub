@@ -187,7 +187,9 @@ fn live_windows(home: Option<&Path>) -> Option<Vec<Value>> {
         LIVE_TIMEOUT,
         home,
     )?;
-    parse_live(&serde_json::from_str(&out).ok()?)
+    let windows = parse_live(&serde_json::from_str(&out).ok()?)?;
+    crate::accounts::sync_usage_windows(home, &windows);
+    Some(windows)
 }
 
 pub fn account_card(home: Option<&Path>) -> Result<Value, String> {

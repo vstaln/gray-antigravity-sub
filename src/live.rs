@@ -720,15 +720,32 @@ pub fn run_turn(
     isolated: bool,
     account: Option<&crate::accounts::Pick>,
 ) -> Result<Vec<u8>, String> {
-    let home = account.and_then(|p| p.home.as_deref());
-    let out = run_turn_on(body, model, effort, timeout, isolated, home);
-    if let Some(p) = account {
+    let mut cur = account.cloned();
+    let mut tried = std::collections::HashSet::new();
+    loop {
+        let home = cur.as_ref().and_then(|p| p.home.as_deref());
+        let out = run_turn_on(body, model, effort, timeout, isolated, home);
+        let Some(p) = &cur else {
+            return out;
+        };
+        tried.insert(p.label.clone());
         match &out {
-            Ok(_) => crate::accounts::note_success(&p.label),
-            Err(e) => crate::accounts::note_failure(&p.label, e),
+            Ok(_) => {
+                crate::accounts::note_success_for(&p.label, model);
+                return out;
+            }
+            Err(e) => {
+                crate::accounts::note_failure_for(&p.label, model, e);
+                if chat::verdict_of(e).is_none() {
+                    return out;
+                }
+                match crate::accounts::pick_for(model) {
+                    Ok(Some(next)) if !tried.contains(&next.label) => cur = Some(next),
+                    _ => return out,
+                }
+            }
         }
     }
-    out
 }
 
 fn run_turn_on(

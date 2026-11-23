@@ -284,12 +284,11 @@ async fn chat_turn(relays: &Relays, params: Value) -> Result<Value, ProviderRpcE
     if provider != manifest::PROVIDER_ID {
         return Err(ProviderRpcError::Protocol("unknown provider".into()));
     }
-    let model = params
+    let raw_model = params
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or("flash")
+        .unwrap_or("")
         .to_string();
-    // Fail fast before opening anything: no binary, no login, no relay.
     if crate::setup::resolve_command().is_none() {
         return Err(ProviderRpcError::Unavailable(setup::INSTALL_HINT.into()));
     }
@@ -298,12 +297,15 @@ async fn chat_turn(relays: &Relays, params: Value) -> Result<Value, ProviderRpcE
             "subscription provider refuses conflicting {key}: unset it so native uses your Antigravity login"
         )));
     }
-    // No token file means no login: `/connect` shows the hint instead of a
-    // turn that dies later. (The full probe runs a model call; too slow here.)
     if !antigravity_sub::chat::has_auth_store() {
         return Err(ProviderRpcError::Unavailable(setup::LOGIN_HINT.into()));
     }
-    let account = accounts::pick().map_err(ProviderRpcError::Unavailable)?;
+    let account = accounts::pick_for(&raw_model).map_err(ProviderRpcError::Unavailable)?;
+    let model = if raw_model.is_empty() {
+        "flash".to_string()
+    } else {
+        raw_model
+    };
     let bearer = format!("antigravity-sub-{}", hex_id());
     // The relay server is per-turn: bind now so the host gets a live port.
     // The admitted POST carries the Responses body; the handler translates,
