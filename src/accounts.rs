@@ -151,7 +151,7 @@ fn ensure_default(store: &mut Store) {
     {
         return;
     }
-    let has_ambient = crate::chat::credential_file().is_some()
+    let has_ambient = crate::agy::credential_file().is_some()
         || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty())
         || cfg!(target_os = "macos");
     if !has_ambient {
@@ -256,7 +256,7 @@ fn load_checked() -> Result<Store, String> {
 fn mutate<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
     let path = file_path().ok_or("cannot resolve GRAY_HOME")?;
     let _lock =
-        crate::session::lock_file(&path).map_err(|e| format!("lock {}: {e}", path.display()))?;
+        crate::store::lock_file(&path).map_err(|e| format!("lock {}: {e}", path.display()))?;
     let mut store: Store = match std::fs::read_to_string(&path) {
         Ok(text) if text.trim().is_empty() => Store::default(),
         Ok(text) => serde_json::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?,
@@ -269,7 +269,7 @@ fn mutate<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, Strin
     let out = f(&mut store)?;
     if serde_json::to_string(&store).map_err(|e| e.to_string())? != before {
         let text = serde_json::to_string_pretty(&store).map_err(|e| e.to_string())?;
-        crate::session::write_atomic(&path, text.as_bytes())
+        crate::store::write_atomic(&path, text.as_bytes())
             .map_err(|e| format!("{}: {e}", path.display()))?;
     }
     Ok(out)
@@ -532,7 +532,7 @@ pub fn note_failure(label: &str, detail: &str) {
 }
 
 pub fn note_failure_for(label: &str, model: &str, detail: &str) {
-    let Some(verdict) = crate::chat::verdict_of(detail) else {
+    let Some(verdict) = crate::agy::verdict_of(detail) else {
         return;
     };
     let groups = model_groups(model);
@@ -544,12 +544,12 @@ pub fn note_failure_for(label: &str, model: &str, detail: &str) {
         let msg: String = detail.chars().take(200).collect();
         if let Some(a) = store.accounts.iter_mut().find(|a| a.label == label) {
             match verdict {
-                crate::chat::Verdict::Unauthorized => {
+                crate::agy::Verdict::Unauthorized => {
                     let cur = until_of(&current_auth(a, now));
                     let until = cur.max(now + COOL_401.min(cap).max(1));
                     a.health = Health::AuthFailed { until, msg };
                 }
-                crate::chat::Verdict::RateLimited { retry_after } => {
+                crate::agy::Verdict::RateLimited { retry_after } => {
                     let ttl = match retry_after {
                         Some(d) => d.as_secs().min(MAX_RESET),
                         None => COOL_429,

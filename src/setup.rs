@@ -168,7 +168,7 @@ pub fn probe_login() -> LoginState {
     // the staged symlink. A remembered login is checked only after the
     // auth store: a removed credential must read as logged out, not as
     // the cached answer.
-    if !crate::chat::has_auth_store() {
+    if !crate::agy::has_auth_store() {
         return LoginState::LoggedOut;
     }
     static LOGGED_IN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -189,7 +189,7 @@ pub fn probe_login() -> LoginState {
         return LoginState::Unknown;
     }
     #[cfg(unix)]
-    if let Some(token_src) = crate::chat::use_token(None)
+    if let Some(token_src) = crate::agy::use_token(None)
         && std::os::unix::fs::symlink(&token_src, cli_dir.join("antigravity-oauth-token")).is_err()
     {
         return LoginState::Unknown;

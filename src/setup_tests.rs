@@ -72,7 +72,7 @@ fn probe_with_real_login_reports_logged_in() {
     // has_auth_store() is always true on macOS (keyring), which says
     // nothing about whether a probe here can succeed — require a store
     // the test environment can actually present.
-    let probeable = crate::chat::credential_file().is_some()
+    let probeable = crate::agy::credential_file().is_some()
         || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty());
     if !probeable {
         eprintln!("SKIP: no agy auth store in this environment");

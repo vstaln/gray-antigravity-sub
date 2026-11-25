@@ -2,17 +2,14 @@
 //! plugin (`antigravity-sub` binary) for Gray's plugin system.
 
 pub mod accounts;
+pub mod agy;
 pub mod catalog;
-pub mod chat;
 pub mod discover;
-pub mod guard;
-pub mod live;
 pub mod manifest;
 pub mod models;
-pub mod relay;
-pub mod session;
 pub mod settings;
 pub mod setup;
+pub mod store;
 
 #[cfg(test)]
 pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

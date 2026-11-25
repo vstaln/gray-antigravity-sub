@@ -20,13 +20,17 @@
 //! - `plugin/shutdown` → clean exit. Unknown methods are protocol errors
 //!   (provider sidecars must fail loudly, never hang a turn).
 
-use antigravity_sub::{accounts, catalog, live, manifest, models, relay, setup, usage};
+use acp_bridge::relay::{self, Intents, TurnFn};
+use acp_bridge::session::{self, Pool};
+use antigravity_sub::agy::{self, AgyDriver};
+use antigravity_sub::{accounts, catalog, manifest, models, setup, usage};
 
 use gray_plugin::{ProviderRefreshRequest, ProviderRevokeRequest, ProviderRpcError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::OnceLock;
 use std::sync::{Arc, Mutex};
 
 #[derive(Deserialize)]
@@ -47,9 +51,14 @@ struct Response {
     error: Option<Value>,
 }
 
-/// Active relay intents by per-turn token (see `relay::RelayIntent`):
-/// the relay server fills the transcript in when the host POSTs.
-type Relays = relay::Intents;
+type Relays = Intents;
+
+const MAX_ACCOUNT_RETRIES: usize = 3;
+
+fn pool() -> &'static Arc<Pool> {
+    static POOL: OnceLock<Arc<Pool>> = OnceLock::new();
+    POOL.get_or_init(|| Pool::new(Arc::new(AgyDriver::default())))
+}
 
 fn cli_help() -> String {
     "antigravity-sub — Antigravity subscription provider for gray\n\
@@ -119,10 +128,6 @@ async fn main() -> anyhow::Result<()> {
     std::thread::spawn(|| {
         let _ = antigravity_sub::discover::live();
     });
-    // Re-pool sessions persisted before a restart so their upstream
-    // prefix stays warm and the next turn continues them — best-effort,
-    // background.
-    std::thread::spawn(live::rewarm);
     let relays: Relays = Arc::new(Mutex::new(HashMap::new()));
     let mut lines =
         tokio::io::AsyncBufReadExt::lines(tokio::io::BufReader::new(tokio::io::stdin()));
@@ -141,7 +146,6 @@ async fn main() -> anyhow::Result<()> {
         };
         if request.id.is_null() {
             if request.method == "plugin/shutdown" {
-                live::shutdown_all();
                 return Ok(());
             }
             continue;
@@ -164,14 +168,9 @@ async fn main() -> anyhow::Result<()> {
         let _ = writeln!(stdout, "{frame}");
         stdout.flush()?;
         if request.method == "plugin/shutdown" {
-            live::shutdown_all();
             return Ok(());
         }
     }
-    // The host's stdin went away: close pooled sessions before exiting
-    // (each `agy` would exit on its own stdin EOF, this just makes it
-    // prompt and certain).
-    live::shutdown_all();
     Ok(())
 }
 
@@ -297,50 +296,33 @@ async fn chat_turn(relays: &Relays, params: Value) -> Result<Value, ProviderRpcE
             "subscription provider refuses conflicting {key}: unset it so native uses your Antigravity login"
         )));
     }
-    if !antigravity_sub::chat::has_auth_store() {
+    if !antigravity_sub::agy::has_auth_store() {
         return Err(ProviderRpcError::Unavailable(setup::LOGIN_HINT.into()));
     }
-    let account = accounts::pick_for(&raw_model).map_err(ProviderRpcError::Unavailable)?;
     let model = if raw_model.is_empty() {
         "flash".to_string()
     } else {
         raw_model
     };
-    let bearer = format!("antigravity-sub-{}", hex_id());
-    // The relay server is per-turn: bind now so the host gets a live port.
-    // The admitted POST carries the Responses body; the handler translates,
-    // spawns native, folds SSE and streams it back.
-    let intent = relay::RelayIntent {
-        model: model.clone(),
-        account,
-    };
-    relays
-        .lock()
-        .map(|mut r| {
-            r.insert(bearer.clone(), intent);
-        })
-        .ok();
-    let relays2 = relays.clone();
-    let bearer2 = bearer.clone();
-    let (port, _handle) =
-        relay::start_turn_server(relays2, bearer2).map_err(ProviderRpcError::Unavailable)?;
-    // The handle is intentionally detached: the turn ends when the admitted
-    // POST completes (or the sidecar exits); the OS reaps the listener.
-    std::mem::forget(_handle);
+    let turn: TurnFn = Arc::new(|raw: &[u8], cancel: &std::sync::atomic::AtomicBool| {
+        let mut attempt = 0;
+        loop {
+            let out = session::run_turn(pool(), raw, cancel);
+            match &out {
+                Err(e) if attempt < MAX_ACCOUNT_RETRIES && agy::verdict_of(e).is_some() => {
+                    attempt += 1;
+                }
+                _ => return out,
+            }
+        }
+    });
+    let (relay_url, relay_token) = relay::mint_turn(relays, &model, turn, "antigravity-sub-")
+        .map_err(ProviderRpcError::Unavailable)?;
     Ok(json!({
-        "relay_url": format!("http://127.0.0.1:{port}/relay/{bearer}/responses"),
-        "relay_token": bearer,
+        "relay_url": relay_url,
+        "relay_token": relay_token,
         "native_model": catalog::native_model(&model),
     }))
-}
-
-fn hex_id() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let t = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.subsec_nanos())
-        .unwrap_or(0);
-    format!("{:08x}{:08x}", t, std::process::id())
 }
 
 fn ensure_provider(provider: &str, auth_method: &str) -> Result<(), ProviderRpcError> {
