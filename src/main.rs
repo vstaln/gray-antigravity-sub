@@ -20,10 +20,10 @@
 //! - `plugin/shutdown` → clean exit. Unknown methods are protocol errors
 //!   (provider sidecars must fail loudly, never hang a turn).
 
-use acp_bridge::relay::{self, Intents, TurnFn};
-use acp_bridge::session::{self, Pool};
 use antigravity_sub::agy::{self, AgyDriver};
 use antigravity_sub::{accounts, catalog, manifest, models, setup, usage};
+use gray_acp::relay::{self, Intents, TurnFn};
+use gray_acp::session::{self, Pool};
 
 use gray_plugin::{ProviderRefreshRequest, ProviderRevokeRequest, ProviderRpcError};
 use serde::{Deserialize, Serialize};

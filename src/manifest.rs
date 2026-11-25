@@ -31,6 +31,7 @@ pub fn manifest() -> gray_plugin::Manifest {
         ],
         providers: vec![provider()],
         provider_errors: Vec::new(),
+        ..Default::default()
     }
 }
 

@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
-use acp_bridge::acp::{AcpClient, SpawnSpec};
-use acp_bridge::chat::{PreparedTurn, Usage};
-use acp_bridge::session::{Driver, PermissionDecision};
+use gray_acp::acp::{AcpClient, SpawnSpec};
+use gray_acp::chat::{PreparedTurn, Usage};
+use gray_acp::session::{Driver, PermissionDecision};
 use serde_json::{Map, Value, json};
 
 use crate::{accounts, catalog, settings::ToolPolicy, setup, usage};
