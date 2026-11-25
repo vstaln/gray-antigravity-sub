@@ -41,16 +41,82 @@ pub fn manifest() -> gray_plugin::Manifest {
 /// model picker on Antigravity's rows — while `/antigravity tools …`
 /// owns the tool allowlist (see [`crate::settings`]), answered as
 /// `{"text": …}`.
-pub fn run_command(name: &str, argv: &[String]) -> Option<serde_json::Value> {
-    if name == ANTIGRAVITY_COMMAND {
-        if argv.is_empty() {
-            return Some(serde_json::json!({}));
-        }
-        return Some(serde_json::json!({
-            "text": crate::settings::command(argv),
-        }));
+fn strip_antigravity_prefix(raw: &str) -> Option<&str> {
+    let trimmed = raw.trim_start();
+    let rest = trimmed
+        .strip_prefix(ANTIGRAVITY_COMMAND)
+        .or_else(|| trimmed.strip_prefix("antigravity"))?;
+    let next = rest.chars().next()?;
+    if !next.is_whitespace() {
+        return None;
     }
-    None
+    let body = rest.trim_start();
+    (!body.is_empty()).then_some(body)
+}
+
+fn format_commands(commands: &[gray_acp::session::SlashCommand]) -> String {
+    if commands.is_empty() {
+        return "no Antigravity ACP commands discovered yet".to_string();
+    }
+    let mut lines =
+        vec!["Antigravity ACP commands (run as `/antigravity <command> [args…]`):".to_string()];
+    for c in commands {
+        if c.description.is_empty() {
+            lines.push(format!("  /antigravity {}", c.name));
+        } else {
+            lines.push(format!("  /antigravity {:<20} {}", c.name, c.description));
+        }
+    }
+    lines.join("\n")
+}
+
+pub fn run_command(
+    name: &str,
+    argv: &[String],
+    raw: Option<&str>,
+    provider_id: Option<&str>,
+    commands: &[gray_acp::session::SlashCommand],
+) -> Option<serde_json::Value> {
+    if name != ANTIGRAVITY_COMMAND {
+        return None;
+    }
+    if argv.is_empty() {
+        return Some(serde_json::json!({}));
+    }
+    match argv[0].as_str() {
+        "account" | "tools" => Some(serde_json::json!({
+            "text": crate::settings::command(argv),
+        })),
+        "commands" => Some(serde_json::json!({
+            "text": format_commands(commands),
+        })),
+        other => {
+            let cmd = other.trim_start_matches('/');
+            if commands.iter().any(|c| c.name == cmd) {
+                if provider_id.is_some_and(|p| {
+                    p != PROVIDER_ID && p.rsplit_once(':').map(|(_, id)| id) != Some(PROVIDER_ID)
+                }) {
+                    return Some(serde_json::json!({
+                        "text": format!(
+                            "switch to an Antigravity model first (`/antigravity`) to run /{cmd}"
+                        ),
+                    }));
+                }
+                let prompt = match raw.and_then(strip_antigravity_prefix) {
+                    Some(body) if body.starts_with('/') => body.to_string(),
+                    Some(body) => format!("/{body}"),
+                    None if argv.len() > 1 => format!("/{cmd} {}", argv[1..].join(" ")),
+                    None => format!("/{cmd}"),
+                };
+                return Some(serde_json::json!({
+                    "prompt": prompt,
+                }));
+            }
+            Some(serde_json::json!({
+                "text": crate::settings::command(argv),
+            }))
+        }
+    }
 }
 
 /// Antigravity subscription provider. Requests go to the loopback relay the

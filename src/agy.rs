@@ -5,17 +5,69 @@ use std::time::Duration;
 
 use gray_acp::acp::{AcpClient, SpawnSpec};
 use gray_acp::chat::{PreparedTurn, Usage};
-use gray_acp::session::{Driver, PermissionDecision};
+use gray_acp::session::{Driver, PermissionDecision, SlashCommand};
 use serde_json::{Map, Value, json};
 
-use crate::{accounts, catalog, settings::ToolPolicy, setup, usage};
+use crate::{accounts, catalog, settings::ToolPolicy, setup, store, usage};
 
 const SERVER: &str = "gray";
 const MCP_CALL_TIMEOUT_SECS: u64 = 24 * 3600;
 const TOOL_NOTE: &str = "Tools: use only the tools of the `gray` MCP server (named mcp_gray_<tool>, \
-    or reached through call_mcp_tool with ServerName \"gray\"). Antigravity's built-in tools are \
-    switched off in this harness and every call to one is refused. The tool descriptions above \
-    use the bare names (for example `bash`); they are the same tools.";
+    or reached through call_mcp_tool with ServerName \"gray\"). Antigravity's built-in workspace, \
+    shell, file, and external tools are switched off in this harness and every call to one is refused. \
+    When an Antigravity slash command (such as /swarm) is active, you may use its built-in \
+    coordination tools (swarm, swarm_wait, post_message, read_board), but all workspace, shell, \
+    file, and external actions — including inside swarm workers — must still use only mcp_gray_* \
+    tools. The tool descriptions above use the bare names (for example `bash`); they are the same \
+    tools.";
+
+const SWARM_TOOLS: &[&str] = &["swarm", "swarm_wait", "post_message", "read_board"];
+
+const DEFAULT_COMMANDS: &[(&str, &str)] = &[
+    (
+        "swarm",
+        "Run a swarm of agents working in parallel through a shared message board.",
+    ),
+    ("plan", "Plan carefully before executing a task."),
+    ("grill-me", "Interview to align on a plan."),
+    (
+        "boost",
+        "Invoke the Boost multi-agent orchestrator for complex tasks.",
+    ),
+    (
+        "teamwork",
+        "Invoke a team of agents to autonomously tackle large projects.",
+    ),
+    (
+        "goal",
+        "Run until the specified goal is completely finished.",
+    ),
+    (
+        "schedule",
+        "Run an instruction on a recurring schedule or as a one-time timer.",
+    ),
+    ("browser", "Invoke a browser agent for web tasks."),
+    (
+        "compact",
+        "Compact the conversation to free up the context window.",
+    ),
+    (
+        "learn",
+        "Reflect on recent successes or corrections to capture reusable skills or rules.",
+    ),
+    (
+        "run-workflow",
+        "Write and run a dynamic workflow script orchestrating agents.",
+    ),
+    (
+        "agy-customizations",
+        "Guide and reference for the Antigravity customization system.",
+    ),
+    (
+        "antigravity-guide",
+        "Guide and quick reference for Google Antigravity.",
+    ),
+];
 
 #[derive(Default)]
 pub struct AgyDriver {
@@ -192,6 +244,52 @@ fn gray_title(title: &str) -> bool {
     name.starts_with("mcp_gray_")
 }
 
+fn commands_file() -> Option<PathBuf> {
+    gray_core::paths::gray_home().map(|h| h.join("antigravity-sub").join("commands.json"))
+}
+
+pub fn cached_commands() -> Vec<SlashCommand> {
+    if let Some(path) = commands_file()
+        && let Ok(text) = std::fs::read_to_string(path)
+        && let Ok(cmds) = serde_json::from_str::<Vec<SlashCommand>>(&text)
+        && !cmds.is_empty()
+    {
+        return cmds;
+    }
+    DEFAULT_COMMANDS
+        .iter()
+        .map(|(name, description)| SlashCommand {
+            name: (*name).to_string(),
+            description: (*description).to_string(),
+        })
+        .collect()
+}
+
+fn bare_title_name(title: &str) -> &str {
+    let trimmed = title.trim().trim_end_matches('?');
+    let rest = trimmed
+        .strip_prefix("Running ")
+        .or_else(|| trimmed.strip_prefix("Run "))
+        .unwrap_or(trimmed);
+    rest.split_whitespace().next().unwrap_or("")
+}
+
+fn is_swarm_orchestration_call(tool_call: &Value) -> bool {
+    let raw = tool_call.get("rawInput");
+    if raw.and_then(|r| r.get("CommandLine")).is_some() {
+        return false;
+    }
+    let name_match = tool_call
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|n| SWARM_TOOLS.contains(&n));
+    let title_match = tool_call
+        .get("title")
+        .and_then(Value::as_str)
+        .is_some_and(|t| SWARM_TOOLS.contains(&bare_title_name(t)));
+    name_match || title_match
+}
+
 fn is_gray_call(tool_call: &Value) -> bool {
     let raw = tool_call.get("rawInput");
     if raw
@@ -350,8 +448,10 @@ impl Driver for AgyDriver {
     }
 
     fn permission_option(&self, params: &Value) -> PermissionDecision {
-        let gray = params.get("toolCall").is_some_and(is_gray_call);
-        if !gray {
+        let allowed = params
+            .get("toolCall")
+            .is_some_and(|tc| is_gray_call(tc) || is_swarm_orchestration_call(tc));
+        if !allowed {
             return PermissionDecision::Deny;
         }
         let options = params.get("options").and_then(Value::as_array);
@@ -417,6 +517,17 @@ impl Driver for AgyDriver {
                 }
                 true
             }
+        }
+    }
+
+    fn on_commands(&self, commands: &[SlashCommand]) {
+        if commands.is_empty() {
+            return;
+        }
+        if let Some(path) = commands_file()
+            && let Ok(bytes) = serde_json::to_vec(commands)
+        {
+            let _ = store::write_atomic(&path, &bytes);
         }
     }
 }

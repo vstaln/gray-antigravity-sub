@@ -180,6 +180,8 @@ const USAGE: &str = "\
   /antigravity tools +name    also allow one tool or prefix*, e.g. +mcp__*
   /antigravity tools -name    remove one
 /antigravity account — the Antigravity logins: list · status · usage · use · strategy.
+/antigravity commands — list Antigravity ACP slash commands (e.g. `/antigravity swarm …`).
+/antigravity <command> [args…] — run an Antigravity ACP slash command under Gray's tools and rules.
 Same from a shell: `gray antigravity-sub tools …`.";
 
 fn status_line(policy: &ToolPolicy) -> String {
