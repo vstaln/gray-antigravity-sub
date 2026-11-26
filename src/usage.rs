@@ -233,6 +233,9 @@ fn group_short(name: &str) -> String {
 }
 
 fn bucket_window(group: &str, b: &Value) -> Option<Value> {
+    if b["disabled"].as_bool() == Some(true) {
+        return None;
+    }
     let remaining = b["remaining_fraction"].as_f64()?;
     let (span, kind) = match b["window"].as_str() {
         Some("5h") => ("5h", "session"),
@@ -240,12 +243,18 @@ fn bucket_window(group: &str, b: &Value) -> Option<Value> {
         Some(other) => (other, "other"),
         None => ("Quota", "other"),
     };
+    let resets_at = match b["reset_time"].as_str() {
+        Some(s) if !s.is_empty() && !s.starts_with("1970-01-01T00:00:00") => {
+            Value::String(s.to_string())
+        }
+        _ => Value::Null,
+    };
     Some(json!({
         "id": b["id"].clone(),
         "label": format!("{span} \u{b7} {group}"),
         "kind": kind,
         "used_percent": ((1.0 - remaining) * 100.0).clamp(0.0, 100.0),
-        "resets_at": b["reset_time"].clone(),
+        "resets_at": resets_at,
     }))
 }
 

@@ -17,6 +17,7 @@ pub const ANTIGRAVITY_COMMAND: &str = "/antigravity";
 /// performs no OAuth, it only names the login the chat path probes before
 /// spawning.
 pub fn manifest() -> gray_plugin::Manifest {
+    crate::agy::sync_completion_file(&crate::agy::cached_commands());
     gray_plugin::Manifest {
         name: PLUGIN_NAME.to_string(),
         version: PLUGIN_VERSION.to_string(),
@@ -25,6 +26,7 @@ pub fn manifest() -> gray_plugin::Manifest {
         hooks: Vec::new(),
         protocol: Some("1.2".to_string()),
         subcommands: Vec::new(),
+        completion: crate::agy::static_completion_args(),
         capabilities: vec![
             PROVIDER_CREDENTIALS.to_string(),
             gray_plugin::capabilities::HOST_SAY.to_string(),

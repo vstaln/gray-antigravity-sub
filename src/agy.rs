@@ -15,13 +15,28 @@ const MCP_CALL_TIMEOUT_SECS: u64 = 24 * 3600;
 const TOOL_NOTE: &str = "Tools: use only the tools of the `gray` MCP server (named mcp_gray_<tool>, \
     or reached through call_mcp_tool with ServerName \"gray\"). Antigravity's built-in workspace, \
     shell, file, and external tools are switched off in this harness and every call to one is refused. \
-    When an Antigravity slash command (such as /swarm) is active, you may use its built-in \
-    coordination tools (swarm, swarm_wait, post_message, read_board), but all workspace, shell, \
-    file, and external actions — including inside swarm workers — must still use only mcp_gray_* \
-    tools. The tool descriptions above use the bare names (for example `bash`); they are the same \
-    tools.";
+    When an Antigravity slash command (such as /swarm, /plan, /grill-me, /teamwork, /boost, /goal, \
+    /schedule, or /run-workflow) is active, you may use its built-in coordination and orchestration \
+    tools (swarm, swarm_wait, post_message, read_board, ask_question, update_steps, schedule, \
+    run_workflow, invoke_subagent, define_subagent, manage_subagents, send_message), but all \
+    workspace, shell, file, and external actions — including inside swarm workers and subagents — \
+    must still use only mcp_gray_* tools. The tool descriptions above use the bare names (for \
+    example `bash`); they are the same tools.";
 
-const SWARM_TOOLS: &[&str] = &["swarm", "swarm_wait", "post_message", "read_board"];
+const ORCHESTRATION_TOOLS: &[&str] = &[
+    "swarm",
+    "swarm_wait",
+    "post_message",
+    "read_board",
+    "ask_question",
+    "update_steps",
+    "schedule",
+    "run_workflow",
+    "invoke_subagent",
+    "define_subagent",
+    "manage_subagents",
+    "send_message",
+];
 
 const DEFAULT_COMMANDS: &[(&str, &str)] = &[
     (
@@ -282,11 +297,11 @@ fn is_swarm_orchestration_call(tool_call: &Value) -> bool {
     let name_match = tool_call
         .get("name")
         .and_then(Value::as_str)
-        .is_some_and(|n| SWARM_TOOLS.contains(&n));
+        .is_some_and(|n| ORCHESTRATION_TOOLS.contains(&n));
     let title_match = tool_call
         .get("title")
         .and_then(Value::as_str)
-        .is_some_and(|t| SWARM_TOOLS.contains(&bare_title_name(t)));
+        .is_some_and(|t| ORCHESTRATION_TOOLS.contains(&bare_title_name(t)));
     name_match || title_match
 }
 
@@ -538,5 +553,66 @@ impl Driver for AgyDriver {
         {
             let _ = store::write_atomic(&path, &bytes);
         }
+        sync_completion_file(commands);
+    }
+}
+
+const OPERATOR_COMPLETIONS: &[(&str, &str)] = &[
+    ("commands", "list Antigravity ACP slash commands"),
+    ("tools", "show or set upstream harness tool allowlist"),
+    ("tools all", "allow every harness tool the host sends"),
+    (
+        "tools default",
+        "bash, toolbox, subagents, file and core tools",
+    ),
+    ("tools bash", "allow bash only"),
+    ("account", "manage Antigravity logins"),
+    ("account list", "list Antigravity accounts and health"),
+    (
+        "account status",
+        "show which Antigravity account serves now",
+    ),
+    ("account usage", "show Antigravity account quota usage"),
+    ("account use", "pin an Antigravity account"),
+    ("account strategy", "set account selection strategy"),
+];
+
+pub fn static_completion_args() -> Vec<String> {
+    let mut out: Vec<String> = DEFAULT_COMMANDS
+        .iter()
+        .map(|(n, _)| (*n).to_string())
+        .collect();
+    for (arg, _) in OPERATOR_COMPLETIONS {
+        if !out.iter().any(|existing| existing == arg) {
+            out.push((*arg).to_string());
+        }
+    }
+    out
+}
+
+pub fn sync_completion_file(commands: &[SlashCommand]) {
+    let Some(home) = gray_core::paths::gray_home() else {
+        return;
+    };
+    let path = home.join("plugins").join("antigravity-sub-completion.json");
+    let mut entries: Vec<Value> = Vec::new();
+    let mut seen: Vec<String> = Vec::new();
+    for cmd in commands {
+        let arg = cmd.name.trim_start_matches('/').trim();
+        if arg.is_empty() || seen.iter().any(|s| s == arg) {
+            continue;
+        }
+        seen.push(arg.to_string());
+        entries.push(json!({"arg": arg, "description": cmd.description}));
+    }
+    for (arg, desc) in OPERATOR_COMPLETIONS {
+        if seen.iter().any(|s| s == arg) {
+            continue;
+        }
+        seen.push((*arg).to_string());
+        entries.push(json!({"arg": arg, "description": desc}));
+    }
+    if let Ok(bytes) = serde_json::to_vec(&json!({"completion": entries})) {
+        let _ = store::write_atomic(&path, &bytes);
     }
 }
