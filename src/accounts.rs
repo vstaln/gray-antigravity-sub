@@ -874,9 +874,14 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
     let real_home = std::env::var("HOME").unwrap_or_default();
     let shim = dest.join("xdg-open");
     if !real_home.is_empty() {
+        let quote = |v: &str| format!("'{}'", v.replace('\'', "'\\''"));
+        let bus = match std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+            Ok(v) if !v.is_empty() => format!("export DBUS_SESSION_BUS_ADDRESS={}\n", quote(&v)),
+            _ => "unset DBUS_SESSION_BUS_ADDRESS\n".to_string(),
+        };
         let script = format!(
-            "#!/bin/sh\nHOME='{}' exec /usr/bin/xdg-open \"$@\" >/dev/null 2>&1 &\n",
-            real_home.replace('\'', "'\\''")
+            "#!/bin/sh\n{bus}HOME={} exec /usr/bin/xdg-open \"$@\" >/dev/null 2>&1 &\n",
+            quote(&real_home)
         );
         if std::fs::write(&shim, script).is_ok() {
             #[cfg(unix)]

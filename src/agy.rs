@@ -520,6 +520,15 @@ impl Driver for AgyDriver {
         }
     }
 
+    fn reusable(&self, stage: &Path, model: &str) -> bool {
+        let current = accounts::pick_for(model).ok().flatten().map(|p| p.label);
+        let reusable = current == self.pick_of(stage).map(|p| p.label);
+        if !reusable && let Ok(mut picks) = self.picks.lock() {
+            picks.remove(stage);
+        }
+        reusable
+    }
+
     fn on_commands(&self, commands: &[SlashCommand]) {
         if commands.is_empty() {
             return;
