@@ -501,7 +501,7 @@ dependencies = [
 [[package]]
 name = "gray-acp"
 version = "0.2.32"
-source = "git+https://github.com/vstaln/gray.git#271cf806d9fd242e06f0f64eb351d05e3f35d05f"
+source = "git+https://github.com/vstaln/gray.git#228139d56a4f2e3eacc7d8ec552fc0e84404b59c"
 dependencies = [
  "anyhow",
  "serde",
@@ -527,7 +527,7 @@ dependencies = [
 [[package]]
 name = "gray-core"
 version = "0.2.32"
-source = "git+https://github.com/vstaln/gray.git#271cf806d9fd242e06f0f64eb351d05e3f35d05f"
+source = "git+https://github.com/vstaln/gray.git#228139d56a4f2e3eacc7d8ec552fc0e84404b59c"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -547,7 +547,7 @@ dependencies = [
 [[package]]
 name = "gray-plugin"
 version = "0.2.32"
-source = "git+https://github.com/vstaln/gray.git#271cf806d9fd242e06f0f64eb351d05e3f35d05f"
+source = "git+https://github.com/vstaln/gray.git#228139d56a4f2e3eacc7d8ec552fc0e84404b59c"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -569,7 +569,7 @@ dependencies = [
 [[package]]
 name = "gray-provider"
 version = "0.2.32"
-source = "git+https://github.com/vstaln/gray.git#271cf806d9fd242e06f0f64eb351d05e3f35d05f"
+source = "git+https://github.com/vstaln/gray.git#228139d56a4f2e3eacc7d8ec552fc0e84404b59c"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -588,7 +588,7 @@ dependencies = [
 [[package]]
 name = "gray-tools"
 version = "0.2.32"
-source = "git+https://github.com/vstaln/gray.git#271cf806d9fd242e06f0f64eb351d05e3f35d05f"
+source = "git+https://github.com/vstaln/gray.git#228139d56a4f2e3eacc7d8ec552fc0e84404b59c"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
