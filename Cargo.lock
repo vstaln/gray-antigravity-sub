@@ -513,7 +513,7 @@ dependencies = [
 
 [[package]]
 name = "gray-antigravity-sub"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "anyhow",
  "gray-acp",
