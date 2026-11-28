@@ -153,11 +153,12 @@ fn ensure_default(store: &mut Store) {
     }
     let has_ambient = crate::agy::credential_file().is_some()
         || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty())
-        || cfg!(target_os = "macos");
+        || cfg!(target_os = "macos")
+        || cfg!(windows);
     if !has_ambient {
         return;
     }
-    let email = std::env::var_os("HOME").and_then(|h| identity_of(Path::new(&h)));
+    let email = setup::home_dir().and_then(|h| identity_of(&h));
     if let Some(e) = &email
         && store
             .accounts
@@ -437,23 +438,54 @@ pub fn serving() -> Serving {
     serve(&load())
 }
 
-fn verify(p: &Pick) -> Result<(), String> {
-    let want = load()
-        .accounts
-        .iter()
-        .find(|a| a.label == p.label)
-        .and_then(|a| a.email.clone());
-    let Some((home, want)) = p.home.as_deref().zip(want) else {
-        return Ok(());
-    };
-    let problem = match identity_of(home) {
+fn login_problem(home: &Path, want: &str, requires_file: bool) -> Option<String> {
+    if token_of(home).is_none() && !requires_file {
+        return None;
+    }
+    match identity_of(home) {
         None => Some(format!("signed out: no login in {}", home.display())),
-        Some(got) if !got.eq_ignore_ascii_case(&want) => Some(format!(
+        Some(got) if !got.eq_ignore_ascii_case(want) => Some(format!(
             "signed out: {} is logged in as {got}, not {want}",
             home.display()
         )),
         Some(_) => None,
+    }
+}
+
+pub(crate) fn requires_file_login(home: &Path) -> bool {
+    !setup::home_dir().is_some_and(|own| {
+        own == home
+            || own
+                .canonicalize()
+                .is_ok_and(|own| home.canonicalize().is_ok_and(|home| own == home))
+    })
+}
+
+fn problem_of(a: &Account) -> Option<String> {
+    let home = spawn_home(&a.home)?;
+    login_problem(home, a.email.as_deref()?, requires_file_login(home))
+}
+
+/// A signed-out account is never picked, so `verify` never sees it again
+/// and a fresh `agy` login could not clear the mark. Re-check them (file
+/// reads only) before serving.
+fn revive_signed_out() {
+    let _ = mutate(|store| {
+        for a in &mut store.accounts {
+            if matches!(a.health, Health::SignedOut { .. }) && problem_of(a).is_none() {
+                a.health = Health::Ready;
+            }
+        }
+        Ok(())
+    });
+}
+
+fn verify(p: &Pick) -> Result<(), String> {
+    let store = load();
+    let Some(a) = store.accounts.iter().find(|a| a.label == p.label) else {
+        return Ok(());
     };
+    let problem = problem_of(a);
     let _ = mutate(|store| {
         if let Some(a) = store.accounts.iter_mut().find(|a| a.label == p.label) {
             match (&problem, &a.health) {
@@ -477,6 +509,7 @@ pub fn pick_for(model: &str) -> Result<Option<Pick>, String> {
     if n == 0 {
         return Ok(None);
     }
+    revive_signed_out();
     for _ in 0..=n {
         match serve_for(&load(), &groups) {
             Serving::Account(p) if verify(&p).is_err() => {}
@@ -871,47 +904,55 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
         let _ = std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o700));
     }
     eprintln!("signing {label:?} in under {} …", dest.display());
-    let real_home = std::env::var("HOME").unwrap_or_default();
-    let shim = dest.join("xdg-open");
-    if !real_home.is_empty() {
-        let quote = |v: &str| format!("'{}'", v.replace('\'', "'\\''"));
-        let bus = match std::env::var("DBUS_SESSION_BUS_ADDRESS") {
-            Ok(v) if !v.is_empty() => format!("export DBUS_SESSION_BUS_ADDRESS={}\n", quote(&v)),
-            _ => "unset DBUS_SESSION_BUS_ADDRESS\n".to_string(),
-        };
-        let script = format!(
-            "#!/bin/sh\n{bus}HOME={} exec /usr/bin/xdg-open \"$@\" >/dev/null 2>&1 &\n",
-            quote(&real_home)
-        );
-        if std::fs::write(&shim, script).is_ok() {
-            #[cfg(unix)]
-            {
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(["-p", "/usage"])
+        .envs(setup::child_env())
+        .envs(setup::staged_home_env(&dest))
+        // Pin agy to write/read the token file in `dest` rather than reusing
+        // the ambient OS credential store (Windows Credential Manager / macOS
+        // Keychain / Linux keyring), which would exit 0 with no token file.
+        .envs([
+            setup::keyring_off(&dest),
+            (setup::FILE_TOKEN_STORAGE.to_string(), "1".to_string()),
+        ])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    #[cfg(unix)]
+    let shim = {
+        let real_home = std::env::var("HOME").unwrap_or_default();
+        let shim = dest.join("xdg-open");
+        if !real_home.is_empty() {
+            let quote = |v: &str| format!("'{}'", v.replace('\'', "'\''"));
+            let bus = match std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+                Ok(v) if !v.is_empty() => {
+                    format!("export DBUS_SESSION_BUS_ADDRESS={}\n", quote(&v))
+                }
+                _ => "unset DBUS_SESSION_BUS_ADDRESS\n".to_string(),
+            };
+            let script = format!(
+                "#!/bin/sh\n{bus}HOME={} exec /usr/bin/xdg-open \"$@\" >/dev/null 2>&1 &\n",
+                quote(&real_home)
+            );
+            if std::fs::write(&shim, script).is_ok() {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755));
             }
         }
-    }
-    let path_env = format!(
-        "{}:{}",
-        dest.display(),
-        std::env::var("PATH").unwrap_or_default()
-    );
-    let mut cmd = std::process::Command::new(&binary);
-    cmd.args(["-p", "/usage"])
-        .envs(setup::child_env())
-        .env("HOME", &dest)
-        .env("PATH", path_env)
-        .env("BROWSER", &shim)
-        .envs([setup::keyring_off(&dest)])
-        .stdin(Stdio::inherit())
-        .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit());
-    if std::env::var_os("XAUTHORITY").is_none() && !real_home.is_empty() {
-        let xauth = Path::new(&real_home).join(".Xauthority");
-        if xauth.is_file() {
-            cmd.env("XAUTHORITY", xauth);
+        let path_env = format!(
+            "{}:{}",
+            dest.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        cmd.env("PATH", path_env).env("BROWSER", &shim);
+        if std::env::var_os("XAUTHORITY").is_none() && !real_home.is_empty() {
+            let xauth = Path::new(&real_home).join(".Xauthority");
+            if xauth.is_file() {
+                cmd.env("XAUTHORITY", xauth);
+            }
         }
-    }
+        shim
+    };
     let placed = cmd
         .status()
         .map_err(|e| format!("spawn agy: {e}"))
@@ -922,6 +963,7 @@ fn cmd_add(args: &[String], interactive: bool, json: bool) -> Result<String, Str
                 Err(format!("agy sign-in failed (exited {s})"))
             }
         });
+    #[cfg(unix)]
     let _ = std::fs::remove_file(&shim);
     if let Err(e) = placed {
         let _ = std::fs::remove_dir_all(&dest);
@@ -1085,6 +1127,7 @@ fn account_line(a: &Account, now: u64, selected: &Option<String>) -> String {
 }
 
 fn cmd_list(json: bool) -> Result<String, String> {
+    revive_signed_out();
     let store = load_checked()?;
     if json {
         return store_json(&store);
@@ -1234,4 +1277,45 @@ fn cmd_usage(args: &[String], json: bool) -> Result<String, String> {
         .map(usage_text)
         .collect::<Vec<_>>()
         .join("\n\n"))
+}
+
+#[cfg(test)]
+mod login_tests {
+    use super::login_problem;
+
+    fn home_with_token(email: Option<&str>) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join(".gemini").join("antigravity-cli");
+        std::fs::create_dir_all(&cli).unwrap();
+        let doc = match email {
+            Some(e) => serde_json::json!({ "id_token_email": e }),
+            None => serde_json::json!({}),
+        };
+        std::fs::write(cli.join("antigravity-oauth-token"), doc.to_string()).unwrap();
+        dir
+    }
+
+    #[test]
+    fn own_home_without_token_file_is_not_signed_out() {
+        // The Windows build keeps the login in Credential Manager: no file.
+        let home = tempfile::tempdir().unwrap();
+        assert_eq!(login_problem(home.path(), "a@x.com", false), None);
+    }
+
+    #[test]
+    fn staged_home_without_token_file_is_signed_out() {
+        let home = tempfile::tempdir().unwrap();
+        let msg = login_problem(home.path(), "a@x.com", true).unwrap();
+        assert!(msg.starts_with("signed out: no login in"), "{msg}");
+    }
+
+    #[test]
+    fn token_identity_is_checked_in_any_home() {
+        for staged in [false, true] {
+            let home = home_with_token(Some("A@x.com"));
+            assert_eq!(login_problem(home.path(), "a@x.com", staged), None);
+            let msg = login_problem(home.path(), "b@x.com", staged).unwrap();
+            assert!(msg.contains("logged in as A@x.com, not b@x.com"), "{msg}");
+        }
+    }
 }

@@ -169,14 +169,16 @@ pub fn capture(args: &[&str], timeout: Duration) -> Option<String> {
 
 pub fn capture_in(args: &[&str], timeout: Duration, home: Option<&Path>) -> Option<String> {
     let binary = crate::setup::resolve_command()?;
-    let mut child = Command::new(binary)
+    let mut cmd = Command::new(binary);
+    crate::setup::hide_console(&mut cmd);
+    let mut child = cmd
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .envs(home.map_or_else(crate::setup::child_env, |h| {
             let mut env = crate::setup::child_env();
-            env.push(("HOME".to_string(), h.display().to_string()));
+            env.extend(crate::setup::staged_home_env(h));
             env.extend(crate::setup::account_env(h));
             env
         }))

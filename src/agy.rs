@@ -90,8 +90,7 @@ pub struct AgyDriver {
 }
 
 pub fn credential_file() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME")?;
-    let file = Path::new(&home)
+    let file = setup::home_dir()?
         .join(".gemini")
         .join("antigravity-cli")
         .join("antigravity-oauth-token");
@@ -103,6 +102,9 @@ pub fn has_auth_store() -> bool {
         || accounts::has_token()
         || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some_and(|v| !v.is_empty())
         || cfg!(target_os = "macos")
+        // Windows keeps the login in Credential Manager; report "maybe" and
+        // let the staged probe (`setup::probe_login`) answer for real.
+        || cfg!(windows)
 }
 
 pub fn use_token(account_home: Option<&Path>) -> Option<PathBuf> {
@@ -193,13 +195,21 @@ fn resets_in(low: &str) -> Option<Duration> {
 }
 
 #[cfg(unix)]
-fn link(src: &Path, dst: &Path) -> Result<(), String> {
+pub(crate) fn link(src: &Path, dst: &Path) -> Result<(), String> {
     std::os::unix::fs::symlink(src, dst).map_err(|e| format!("staging link: {e}"))
 }
 
-#[cfg(not(unix))]
-fn link(_src: &Path, _dst: &Path) -> Result<(), String> {
-    Err("antigravity-sub staging needs symlinks and is unix-only".to_string())
+/// Windows symlinks need Developer Mode or elevation, so a directory gets
+/// a junction and a file a hard link (both unprivileged), with a copy as
+/// the fallback for a file on another volume.
+#[cfg(windows)]
+pub(crate) fn link(src: &Path, dst: &Path) -> Result<(), String> {
+    if src.is_dir() {
+        return junction::create(src, dst).map_err(|e| format!("staging junction: {e}"));
+    }
+    std::fs::hard_link(src, dst)
+        .or_else(|_| std::fs::copy(src, dst).map(|_| ()))
+        .map_err(|e| format!("staging link: {e}"))
 }
 
 fn clamp_tier(family: &str, tier: &str) -> &'static str {
@@ -342,10 +352,10 @@ impl Driver for AgyDriver {
         env.retain(|(k, _)| {
             !matches!(
                 k.as_str(),
-                "HOME" | "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "XDG_CACHE_HOME"
+                "HOME" | "USERPROFILE" | "XDG_CONFIG_HOME" | "XDG_DATA_HOME" | "XDG_CACHE_HOME"
             )
         });
-        env.push(("HOME".into(), stage.display().to_string()));
+        env.extend(setup::staged_home_env(stage));
         for (k, sub) in [
             ("XDG_CONFIG_HOME", ".config"),
             ("XDG_DATA_HOME", ".local/share"),
@@ -353,7 +363,7 @@ impl Driver for AgyDriver {
         ] {
             env.push((k.into(), stage.join(sub).display().to_string()));
         }
-        if let Some(pair) = setup::account_env(stage) {
+        for pair in setup::account_env(stage) {
             env.retain(|(k, _)| k != &pair.0);
             env.push(pair);
         }
@@ -388,12 +398,15 @@ impl Driver for AgyDriver {
         let pick = accounts::pick_for(&prep.model)?;
         let account_home = pick.as_ref().and_then(|p| p.home.clone());
         let token = match account_home.as_deref() {
-            Some(home) => Some(use_token(Some(home)).ok_or_else(|| {
-                format!(
-                    "the picked antigravity account has no login in {}",
-                    home.display()
-                )
-            })?),
+            Some(home) => match use_token(Some(home)) {
+                None if accounts::requires_file_login(home) => {
+                    return Err(format!(
+                        "the picked antigravity account has no login in {}",
+                        home.display()
+                    ));
+                }
+                login => login,
+            },
             None if !has_auth_store() => return Err(setup::LOGIN_HINT.to_string()),
             None => credential_file(),
         };
@@ -405,8 +418,8 @@ impl Driver for AgyDriver {
         if let Some(src) = token {
             link(&src, &cli.join("antigravity-oauth-token"))?;
         }
-        if let Some(bin) = std::env::var_os("HOME")
-            .map(|h| Path::new(&h).join(".gemini/antigravity-cli/bin"))
+        if let Some(bin) = setup::home_dir()
+            .map(|h| h.join(".gemini/antigravity-cli/bin"))
             .filter(|p| p.is_dir())
         {
             let _ = link(&bin, &cli.join("bin"));
@@ -417,6 +430,12 @@ impl Driver for AgyDriver {
         }
         std::fs::write(cli.join("settings.json"), settings.to_string())
             .map_err(|e| format!("staging settings.json: {e}"))?;
+        // Suppress agy's background auto-updater in a fresh stage: without
+        // this stamp agy treats the stage as a first run and spawns
+        // `agy --bg-updater` / `agy --version`, flashing console windows on
+        // Windows and risking binary swaps mid-session.
+        std::fs::write(cli.join("last_check.timestamp"), b"")
+            .map_err(|e| format!("staging last_check.timestamp: {e}"))?;
         let policy = ToolPolicy::load();
         let eager: Map<String, Value> = tools
             .iter()
@@ -614,5 +633,133 @@ pub fn sync_completion_file(commands: &[SlashCommand]) {
     }
     if let Ok(bytes) = serde_json::to_vec(&json!({"completion": entries})) {
         let _ = store::write_atomic(&path, &bytes);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn staged_account_pins_its_own_login() {
+        let _env = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let root = tempfile::Builder::new()
+            .prefix("agy-stage-pin-")
+            .tempdir()
+            .unwrap();
+        let gray_home = root.path().join("gray");
+        let account_home = gray_home.join("antigravity-sub/homes/work");
+        let cli = account_home.join(".gemini/antigravity-cli");
+        std::fs::create_dir_all(&cli).unwrap();
+        let token = cli.join("antigravity-oauth-token");
+        let payload = r#"{"token":{"access_token":"a"},"id_token_email":"work@example.com"}"#;
+        std::fs::write(&token, payload).unwrap();
+
+        let store_dir = gray_home.join("antigravity-sub");
+        std::fs::create_dir_all(&store_dir).unwrap();
+        let accounts_json = json!({
+            "version": 1,
+            "strategy": "fill_first",
+            "selected": "work",
+            "accounts": [{
+                "label": "work",
+                "home": account_home,
+                "email": "work@example.com",
+                "org": null,
+                "added_at": 1,
+                "health": {"state": "ready"},
+                "request_count": 0,
+                "last_used_at": 0
+            }]
+        });
+        std::fs::write(
+            store_dir.join("accounts.json"),
+            serde_json::to_string(&accounts_json).unwrap(),
+        )
+        .unwrap();
+
+        let old_gray_home = std::env::var_os("GRAY_HOME");
+        unsafe { std::env::set_var("GRAY_HOME", &gray_home) };
+
+        let stage = tempfile::Builder::new()
+            .prefix("agy-stage-")
+            .tempdir()
+            .unwrap();
+        let driver = AgyDriver::default();
+        let prep = PreparedTurn {
+            system: String::new(),
+            input: Vec::new(),
+            tail: Vec::new(),
+            outputs: Vec::new(),
+            tail_prompt: Vec::new(),
+            tools: Vec::new(),
+            model: "gemini-3.8-flash-low".to_string(),
+            effort: None,
+            overrides: Vec::new(),
+        };
+        let stage_res = driver.stage(stage.path(), "http://127.0.0.1:1/mcp", &[], &prep);
+        let spec = driver.spawn_spec(stage.path());
+
+        match old_gray_home {
+            Some(v) => unsafe { std::env::set_var("GRAY_HOME", v) },
+            None => unsafe { std::env::remove_var("GRAY_HOME") },
+        }
+
+        stage_res.expect("stage pinned account");
+
+        let staged_cli = stage.path().join(".gemini/antigravity-cli");
+        let staged_token = staged_cli.join("antigravity-oauth-token");
+        assert!(staged_token.is_file(), "token must be carried into stage");
+        assert_eq!(std::fs::read_to_string(&staged_token).unwrap(), payload);
+        assert!(
+            staged_cli.join("last_check.timestamp").is_file(),
+            "stage must stamp last_check.timestamp to suppress auto-updater"
+        );
+
+        let env: HashMap<_, _> = spec.env.into_iter().collect();
+        assert_eq!(
+            env.get(setup::FILE_TOKEN_STORAGE).map(String::as_str),
+            Some("1"),
+            "must pin agy to the staged token file rather than the OS credential store"
+        );
+        assert!(
+            env.contains_key("DBUS_SESSION_BUS_ADDRESS"),
+            "must steer Linux agy away from the session keyring"
+        );
+        assert_eq!(
+            env.get("HOME").map(String::as_str),
+            Some(stage.path().to_string_lossy().as_ref())
+        );
+        if cfg!(windows) {
+            assert_eq!(
+                env.get("USERPROFILE").map(String::as_str),
+                Some(stage.path().to_string_lossy().as_ref()),
+                "Windows agy requires USERPROFILE to point at the stage"
+            );
+        }
+    }
+
+    #[test]
+    fn link_dir_teardown_preserves_target() {
+        let root = tempfile::Builder::new()
+            .prefix("agy-link-dir-")
+            .tempdir()
+            .unwrap();
+        let target = root.path().join("target_bin");
+        std::fs::create_dir_all(&target).unwrap();
+        let sentinel = target.join("helper.txt");
+        std::fs::write(&sentinel, b"keep").unwrap();
+
+        let stage = root.path().join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        let dst = stage.join("bin");
+        link(&target, &dst).expect("link directory");
+        assert!(dst.join("helper.txt").is_file());
+
+        std::fs::remove_dir_all(&stage).expect("remove stage");
+        assert!(
+            sentinel.is_file(),
+            "tearing down a staged dir link must never delete target contents"
+        );
     }
 }

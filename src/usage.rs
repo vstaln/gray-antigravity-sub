@@ -53,7 +53,7 @@ fn civil(z: i64) -> (i64, u32, u32) {
 }
 
 fn event_path() -> Option<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from)?;
+    let home = crate::setup::home_dir()?;
     Some(home.join(".cache/antigravity-sub/quota-event.json"))
 }
 
@@ -114,6 +114,7 @@ fn locked_update(path: &Path, apply: impl FnOnce(Option<String>) -> Update) -> s
 }
 
 fn private_options() -> OpenOptions {
+    #[cfg_attr(not(unix), allow(unused_mut))]
     let mut opts = OpenOptions::new();
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut opts, 0o600);
@@ -131,6 +132,7 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     file.sync_all()?;
     drop(file);
     std::fs::rename(&tmp, path)?;
+    #[cfg(unix)]
     if let Some(dir) = path.parent() {
         std::fs::File::open(dir)?.sync_all()?;
     }

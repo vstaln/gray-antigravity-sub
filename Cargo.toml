@@ -35,3 +35,6 @@ debug = "line-tables-only"
 
 [profile.dev.package."*"]
 debug = false
+
+[target.'cfg(windows)'.dependencies]
+junction = "2"

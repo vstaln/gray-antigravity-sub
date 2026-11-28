@@ -40,9 +40,9 @@ fn child_env_strips_gateway_overrides() {
     assert!(!env.iter().any(|(k, _)| k == "GOOGLE_GEMINI_BASE_URL"));
 }
 
-// macOS counts the keyring as an auth store unconditionally, so a
-// HOME/DBUS scrub can never simulate "logged out" there.
-#[cfg(not(target_os = "macos"))]
+// macOS Keychain and Windows Credential Manager count as auth stores
+// unconditionally, so a HOME/DBUS scrub can never simulate "logged out" there.
+#[cfg(not(any(target_os = "macos", windows)))]
 #[test]
 fn probe_without_token_file_is_logged_out_without_spawning() {
     let _env = crate::ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

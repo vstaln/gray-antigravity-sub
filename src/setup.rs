@@ -94,8 +94,56 @@ pub fn keyring_off(home: &std::path::Path) -> (String, String) {
     )
 }
 
-pub fn account_env(home: &std::path::Path) -> Option<(String, String)> {
-    crate::accounts::token_of(home).map(|_| keyring_off(home))
+/// `agy` reads and writes its login as a file under its home when this is
+/// set, instead of the OS credential store. Windows has no D-Bus switch, so
+/// this is the only way to pin a child to a staged token file there.
+pub const FILE_TOKEN_STORAGE: &str = "AGY_CLI_FORCE_FILE_TOKEN_STORAGE";
+
+/// Env that pins an `agy` child to the token file under `home` (when one is
+/// there) instead of the ambient OS credential store.
+pub fn account_env(home: &std::path::Path) -> Vec<(String, String)> {
+    if crate::accounts::token_of(home).is_none() {
+        return Vec::new();
+    }
+    vec![
+        keyring_off(home),
+        (FILE_TOKEN_STORAGE.to_string(), "1".to_string()),
+    ]
+}
+
+/// The user's home: `HOME`, then `USERPROFILE` (a native Windows process
+/// often carries only the latter).
+pub fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()))
+        .map(std::path::PathBuf::from)
+}
+
+/// Env that relocates a child `agy`'s state tree to `home`. Unix `agy`
+/// reads `HOME`; the Windows build reads `USERPROFILE` (and refuses to start
+/// without it), so both are set there.
+pub fn staged_home_env(home: &std::path::Path) -> Vec<(String, String)> {
+    let value = home.display().to_string();
+    let mut out = vec![("HOME".to_string(), value.clone())];
+    if cfg!(windows) {
+        out.push(("USERPROFILE".to_string(), value));
+    }
+    out
+}
+
+/// Keeps a console-subsystem child from opening its own console window on
+/// Windows when the host runs the plugin detached. No-op off Windows.
+#[cfg(windows)]
+pub fn hide_console(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW)
+}
+
+#[cfg(not(windows))]
+pub fn hide_console(cmd: &mut std::process::Command) -> &mut std::process::Command {
+    cmd
 }
 
 pub fn child_env() -> Vec<(String, String)> {
@@ -188,22 +236,16 @@ pub fn probe_login() -> LoginState {
     if std::fs::create_dir_all(&cli_dir).is_err() {
         return LoginState::Unknown;
     }
-    #[cfg(unix)]
     if let Some(token_src) = crate::agy::use_token(None)
-        && std::os::unix::fs::symlink(&token_src, cli_dir.join("antigravity-oauth-token")).is_err()
+        && crate::agy::link(&token_src, &cli_dir.join("antigravity-oauth-token")).is_err()
     {
         return LoginState::Unknown;
     }
-    #[cfg(unix)]
-    if let Some(bin_src) = std::env::var_os("HOME")
-        .map(|h| std::path::Path::new(&h).join(".gemini/antigravity-cli/bin"))
+    if let Some(bin_src) = home_dir()
+        .map(|h| h.join(".gemini/antigravity-cli/bin"))
         .filter(|p| p.is_dir())
     {
-        let _ = std::os::unix::fs::symlink(&bin_src, cli_dir.join("bin"));
-    }
-    #[cfg(not(unix))]
-    {
-        return LoginState::Unknown;
+        let _ = crate::agy::link(&bin_src, &cli_dir.join("bin"));
     }
     if std::fs::write(
         cli_dir.join("settings.json"),
@@ -213,11 +255,14 @@ pub fn probe_login() -> LoginState {
     {
         return LoginState::Unknown;
     }
+    let _ = std::fs::write(cli_dir.join("last_check.timestamp"), b"");
     let timeout_secs: u64 = std::env::var("AGY_SUB_PROBE_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(15);
-    let mut child = match std::process::Command::new(&binary)
+    let mut cmd = std::process::Command::new(&binary);
+    hide_console(&mut cmd);
+    let mut child = match cmd
         .args([
             "--model",
             "gemini-3.8-flash-low",
@@ -233,7 +278,7 @@ pub fn probe_login() -> LoginState {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .envs(child_env())
-        .env("HOME", &home)
+        .envs(staged_home_env(&home))
         .envs(account_env(&home))
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
